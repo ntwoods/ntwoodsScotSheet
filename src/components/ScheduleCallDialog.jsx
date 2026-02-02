@@ -10,7 +10,6 @@ export function ScheduleCallDialog({ order, dealers, onClose, onSubmit }) {
   const [dealerName, setDealerName] = useState(() =>
     inList_(dealers, order?.dealerName) ? String(order?.dealerName || '') : '',
   )
-  const [when, setWhen] = useState('')
 
   const dealerOptions = useMemo(
     () => (dealers || []).slice().sort((a, b) => String(a).localeCompare(String(b))),
@@ -22,8 +21,8 @@ export function ScheduleCallDialog({ order, dealers, onClose, onSubmit }) {
       <button className="btn btnLight" onClick={onClose}>
         Cancel
       </button>
-      <button className="btn btnPrimary" onClick={() => onSubmit({ dealerName, scheduleAt: when })} disabled={!dealerName || !when}>
-        Schedule
+      <button className="btn btnPrimary" onClick={() => onSubmit({ dealerName })} disabled={!dealerName}>
+        Create Follow-up
       </button>
     </>
   )
@@ -46,12 +45,9 @@ export function ScheduleCallDialog({ order, dealers, onClose, onSubmit }) {
           ))}
         </select>
         <div className="hint">This dropdown is filtered for your SCOT login.</div>
+        <div className="hint">A follow-up will be created automatically after 15 days.</div>
       </div>
 
-      <div className="field">
-        <label>Schedule Date & Time</label>
-        <input type="datetime-local" value={when} onChange={(e) => setWhen(e.target.value)} />
-      </div>
     </ModalShell>
   )
 }
