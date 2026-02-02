@@ -251,23 +251,24 @@ a { color: inherit; text-decoration: none; }
   height: calc(100vh - 18px - 18px - 72px - 16px);
   min-height: 620px;
 }
-.rightSection { flex: 1; }
+.rightColumn .panel { min-height: 0; }
+.rightSection { flex: 1; min-height: 0; }
 .rightSection.big { flex: 2; }
 .list {
-  padding: 12px;
+  padding: 10px;
   display: grid;
-  gap: 10px;
+  gap: 8px;
   overflow: auto;
   height: calc(100% - 52px);
 }
 
 .orderCard {
   border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 12px;
+  border-radius: 14px;
+  padding: 10px;
   background: #fff;
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 .orderTop {
   display: flex;
@@ -275,9 +276,10 @@ a { color: inherit; text-decoration: none; }
   justify-content: space-between;
   gap: 10px;
 }
-.orderTitle { font-weight: 800; font-size: 14px; }
-.orderMeta { color: var(--muted); font-size: 12px; }
-.orderActions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.orderTitle { font-weight: 800; font-size: 13px; line-height: 1.2; }
+.orderMeta { color: var(--muted); font-size: 12px; line-height: 1.2; }
+.orderActions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.orderActions .btn { padding: 8px 10px; border-radius: 10px; font-size: 13px; }
 
 .modalOverlay {
   position: fixed;
