@@ -24,11 +24,29 @@ const CFG = {
   orderPunchUrl: import.meta.env.VITE_ORDER_PUNCH_URL || 'https://ntwoods.github.io/ordertodispatch/orderPunch.html',
 }
 
+const DEBUG = (() => {
+  try {
+    return new URLSearchParams(window.location.search).has('debug')
+  } catch {
+    return false
+  }
+})()
+
+function pickArray_(obj, keys) {
+  for (const k of keys) {
+    const v = obj?.[k]
+    if (Array.isArray(v)) return v
+  }
+  return []
+}
+
 export default function App() {
   const [idToken, setIdToken] = useState('')
   const [user, setUser] = useState(null)
   const [loading, setLoading] = useState(false)
   const [toast, setToast] = useState(null)
+  const [lastSyncError, setLastSyncError] = useState('')
+  const [debugPayload, setDebugPayload] = useState(null)
 
   const [todayISO, setTodayISO] = useState('')
   const [dueItems, setDueItems] = useState([])
@@ -65,15 +83,26 @@ export default function App() {
           getDue(CFG.gasBase, idToken),
           getOrderCycleSummary(CFG.gasBase, idToken),
         ])
-        setTodayISO(due.today || '')
-        setDueItems(due.items || [])
-        setOrdersReceived(orderSummary.received || [])
-        setOrdersInProcess(orderSummary.inProcess || [])
+
+        if (DEBUG) {
+          setDebugPayload({ at: new Date().toISOString(), due, orderSummary })
+          console.debug('[SCOT] loadAll()', { due, orderSummary })
+        }
+
+        setLastSyncError('')
+        setTodayISO(due?.today || due?.todayISO || '')
+        setDueItems(pickArray_(due, ['items', 'dueItems', 'due_items']))
+        setOrdersReceived(pickArray_(orderSummary, ['received', 'ordersReceived', 'orders_received']))
+        setOrdersInProcess(pickArray_(orderSummary, ['inProcess', 'in_process', 'ordersInProcess', 'orders_in_process']))
+      } catch (e) {
+        const msg = e?.message || 'Sync failed'
+        setLastSyncError(msg)
+        if (!silent) showToast(msg)
       } finally {
         if (!silent) setLoading(false)
       }
     },
-    [idToken],
+    [idToken, showToast],
   )
 
   useEffect(() => {
@@ -115,6 +144,8 @@ export default function App() {
     }
     setIdToken('')
     setUser(null)
+    setLastSyncError('')
+    setDebugPayload(null)
     setDueItems([])
     setOrdersReceived([])
     setOrdersInProcess([])
@@ -328,6 +359,15 @@ export default function App() {
         </div>
       </header>
 
+      {lastSyncError ? (
+        <div className="panel" style={{ margin: '12px 0', padding: 12, borderLeft: '4px solid var(--danger)' }}>
+          <div style={{ fontWeight: 800 }}>Sync error</div>
+          <div className="muted" style={{ marginTop: 4 }}>
+            {lastSyncError}
+          </div>
+        </div>
+      ) : null}
+
       <div className="layout">
         <section className="panel">
           <div className="panelHeader">
@@ -360,6 +400,29 @@ export default function App() {
           <div className="panel rightSection big">
             <OrdersPanel title="Orders in Process" items={ordersInProcess} onScheduleCall={openSchedule} />
           </div>
+          {DEBUG ? (
+            <details className="panel" style={{ marginTop: 12, padding: 12 }}>
+              <summary style={{ cursor: 'pointer', fontWeight: 800 }}>Debug</summary>
+              <pre style={{ marginTop: 10, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                {JSON.stringify(
+                  {
+                    user: { email: user?.email, name: user?.name },
+                    cfg: { gasBase: CFG.gasBase, orderPunchUrl: CFG.orderPunchUrl },
+                    counts: {
+                      due: dueItems.length,
+                      received: ordersReceived.length,
+                      inProcess: ordersInProcess.length,
+                      dealers: scotDealers.length,
+                    },
+                    lastSyncError: lastSyncError || null,
+                    lastPayload: debugPayload,
+                  },
+                  null,
+                  2,
+                )}
+              </pre>
+            </details>
+          ) : null}
         </div>
       </div>
 
