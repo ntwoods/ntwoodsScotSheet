@@ -40,6 +40,34 @@ function pickArray_(obj, keys) {
   return []
 }
 
+function pad2_(n) {
+  return String(n).padStart(2, '0')
+}
+
+function dateIsoLocal_(d) {
+  const dt = new Date(d)
+  return `${dt.getFullYear()}-${pad2_(dt.getMonth() + 1)}-${pad2_(dt.getDate())}`
+}
+
+function computeAutoFollowup_(todayISO, { days }) {
+  const now = new Date()
+  let base = now
+
+  const s = String(todayISO || '').trim()
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s)
+  if (m) {
+    base = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), now.getHours(), now.getMinutes(), 0, 0)
+  }
+
+  const scheduleAt = new Date(base)
+  scheduleAt.setDate(scheduleAt.getDate() + Number(days || 0))
+
+  return {
+    plannedDateISO: dateIsoLocal_(scheduleAt),
+    scheduleAtISO: scheduleAt.toISOString(),
+  }
+}
+
 export default function App() {
   const [idToken, setIdToken] = useState('')
   const [user, setUser] = useState(null)
@@ -261,7 +289,7 @@ export default function App() {
   const closeSchedule = useCallback(() => setSchedule({ open: false, order: null }), [])
 
   const handleScheduleSubmit = useCallback(
-    async ({ dealerName, scheduleAt }) => {
+    async ({ dealerName }) => {
       if (!user?.email) return
       setLoading(true)
       try {
@@ -278,7 +306,8 @@ export default function App() {
         }
 
         const remark = `Scheduled from OrderCycle (orderId=${schedule.order?.orderId || ''})`
-        const nowISO = todayISO || new Date().toISOString().slice(0, 10)
+        const nowISO = todayISO || dateIsoLocal_(new Date())
+        const { plannedDateISO, scheduleAtISO } = computeAutoFollowup_(todayISO, { days: 15 })
 
         await postMarkNoCors(CFG.gasBase, {
           path: 'mark',
@@ -288,11 +317,11 @@ export default function App() {
           outcome: 'SF',
           remark,
           callN,
-          plannedDate: nowISO,
-          scheduleAt,
+          plannedDate: plannedDateISO,
+          scheduleAt: scheduleAtISO,
         })
 
-        showToast('SF scheduled')
+        showToast('Follow-up scheduled (+15 days)')
         closeSchedule()
         await loadAll()
       } catch (e) {
