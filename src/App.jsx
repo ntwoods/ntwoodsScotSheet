@@ -1,0 +1,409 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { GoogleSignIn } from './components/GoogleSignIn.jsx'
+import { DueCard } from './components/DueCard.jsx'
+import { FollowupModal } from './components/FollowupModal.jsx'
+import { OrdersPanel } from './components/OrdersPanel.jsx'
+import { QuickOrderModal } from './components/QuickOrderModal.jsx'
+import { ScheduleCallDialog } from './components/ScheduleCallDialog.jsx'
+import { LoaderOverlay } from './components/LoaderOverlay.jsx'
+import { Toast } from './components/Toast.jsx'
+import {
+  getDue,
+  getMe,
+  getOrderCycleSummary,
+  getRowByDealer,
+  getScotDealers,
+  getSfRemarks,
+  postMarkNoCors,
+} from './lib/scotApi.js'
+import { computeOverdueCount, formatDateLabel } from './lib/date.js'
+
+const CFG = {
+  clientId: import.meta.env.VITE_CLIENT_ID,
+  gasBase: import.meta.env.VITE_SCOT_GAS_BASE,
+  orderPunchUrl: import.meta.env.VITE_ORDER_PUNCH_URL || 'https://ntwoods.github.io/ordertodispatch/orderPunch.html',
+}
+
+export default function App() {
+  const [idToken, setIdToken] = useState('')
+  const [user, setUser] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [toast, setToast] = useState(null)
+
+  const [todayISO, setTodayISO] = useState('')
+  const [dueItems, setDueItems] = useState([])
+  const [ordersReceived, setOrdersReceived] = useState([])
+  const [ordersInProcess, setOrdersInProcess] = useState([])
+  const [scotDealers, setScotDealers] = useState([])
+
+  const [followup, setFollowup] = useState({ open: false, context: null })
+  const [quickOrderOpen, setQuickOrderOpen] = useState(false)
+  const [schedule, setSchedule] = useState({ open: false, order: null })
+
+  const followupRemarkRef = useRef('')
+
+  const orderPunchOrigin = useMemo(() => {
+    try {
+      return new URL(CFG.orderPunchUrl).origin
+    } catch {
+      return 'https://ntwoods.github.io'
+    }
+  }, [])
+
+  const overdueCount = useMemo(() => computeOverdueCount(dueItems, todayISO), [dueItems, todayISO])
+
+  const showToast = useCallback((msg) => {
+    setToast({ msg, id: Date.now() })
+  }, [])
+
+  const loadAll = useCallback(
+    async ({ silent } = {}) => {
+      if (!idToken) return
+      if (!silent) setLoading(true)
+      try {
+        const [due, orderSummary] = await Promise.all([
+          getDue(CFG.gasBase, idToken),
+          getOrderCycleSummary(CFG.gasBase, idToken),
+        ])
+        setTodayISO(due.today || '')
+        setDueItems(due.items || [])
+        setOrdersReceived(orderSummary.received || [])
+        setOrdersInProcess(orderSummary.inProcess || [])
+      } finally {
+        if (!silent) setLoading(false)
+      }
+    },
+    [idToken],
+  )
+
+  useEffect(() => {
+    if (!idToken || !user) return
+    if (followup.open || quickOrderOpen || schedule.open) return
+    const t = setInterval(() => {
+      loadAll({ silent: true }).catch(() => {})
+    }, 30_000)
+    return () => clearInterval(t)
+  }, [idToken, user, followup.open, quickOrderOpen, schedule.open, loadAll])
+
+  const handleCredential = useCallback(
+    async (credential) => {
+      setIdToken(credential)
+      setLoading(true)
+      try {
+        const who = await getMe(CFG.gasBase, credential)
+        setUser(who.user)
+        const dealers = await getScotDealers(CFG.gasBase, who.user.email)
+        setScotDealers(dealers.dealers || [])
+        await loadAll()
+      } catch (e) {
+        setIdToken('')
+        setUser(null)
+        showToast(e?.message || 'Login failed')
+      } finally {
+        setLoading(false)
+      }
+    },
+    [loadAll, showToast],
+  )
+
+  const signOut = useCallback(() => {
+    try {
+      window.google?.accounts?.id?.disableAutoSelect()
+    } catch (e) {
+      // ignore
+      void e
+    }
+    setIdToken('')
+    setUser(null)
+    setDueItems([])
+    setOrdersReceived([])
+    setOrdersInProcess([])
+    setScotDealers([])
+    setFollowup({ open: false, context: null })
+    setQuickOrderOpen(false)
+    setSchedule({ open: false, order: null })
+  }, [])
+
+  const openFollowup = useCallback(
+    (item, dueCall) => {
+      const ctx = {
+        rowIndex: item.rowIndex,
+        callN: dueCall.callN,
+        clientName: item.clientName,
+        callDate: dueCall.callDate,
+        dateISO: todayISO,
+      }
+      followupRemarkRef.current = ''
+      setFollowup({ open: true, context: ctx })
+    },
+    [todayISO],
+  )
+
+  const closeFollowup = useCallback(() => setFollowup({ open: false, context: null }), [])
+
+  const handleMark = useCallback(
+    async ({ outcome, remark, scheduleAt }) => {
+      const ctx = followup.context
+      if (!ctx) return
+      if (!outcome) return
+
+      setLoading(true)
+      try {
+        const payload = {
+          rowIndex: ctx.rowIndex,
+          date: ctx.dateISO,
+          outcome,
+          remark: remark || '',
+          callN: ctx.callN,
+          plannedDate: ctx.callDate || ctx.dateISO,
+        }
+        if (outcome === 'SF') payload.scheduleAt = scheduleAt
+
+        await postMarkNoCors(CFG.gasBase, { path: 'mark', id_token: idToken, ...payload })
+        showToast(`Saved: ${outcome}`)
+        closeFollowup()
+        await loadAll()
+      } catch (e) {
+        showToast(e?.message || 'Could not save')
+      } finally {
+        setLoading(false)
+      }
+    },
+    [followup.context, idToken, closeFollowup, loadAll, showToast],
+  )
+
+  const handleAutoMarkOR = useCallback(async () => {
+    const ctx = followup.context
+    if (!ctx) return
+    setLoading(true)
+    try {
+      const remark = followupRemarkRef.current || ''
+      const payload = {
+        rowIndex: ctx.rowIndex,
+        date: ctx.dateISO,
+        outcome: 'OR',
+        remark,
+        callN: ctx.callN,
+        plannedDate: ctx.callDate || ctx.dateISO,
+      }
+      await postMarkNoCors(CFG.gasBase, { path: 'mark', id_token: idToken, ...payload })
+      showToast('Saved: OR')
+      closeFollowup()
+      await loadAll()
+    } catch (e) {
+      showToast(e?.message || 'Could not record OR')
+    } finally {
+      setLoading(false)
+    }
+  }, [followup.context, idToken, closeFollowup, loadAll, showToast])
+
+  const handleQuickOrderPunched = useCallback(
+    async ({ dealerName }) => {
+      if (!user?.email || !dealerName) return
+      setLoading(true)
+      try {
+        const row = await getRowByDealer(CFG.gasBase, idToken, user.email, dealerName)
+        const nowISO = todayISO || new Date().toISOString().slice(0, 10)
+        await postMarkNoCors(CFG.gasBase, {
+          path: 'mark',
+          id_token: idToken,
+          rowIndex: row.rowIndex,
+          date: nowISO,
+          outcome: 'OR',
+          remark: 'Quick Order',
+          callN: 0,
+          plannedDate: nowISO,
+        })
+        showToast('Order saved. Follow-ups updated.')
+        setQuickOrderOpen(false)
+        await loadAll()
+      } catch (e) {
+        showToast(e?.message || 'Could not auto-update')
+      } finally {
+        setLoading(false)
+      }
+    },
+    [idToken, user?.email, todayISO, loadAll, showToast],
+  )
+
+  const openSchedule = useCallback((order) => setSchedule({ open: true, order }), [])
+  const closeSchedule = useCallback(() => setSchedule({ open: false, order: null }), [])
+
+  const handleScheduleSubmit = useCallback(
+    async ({ dealerName, scheduleAt }) => {
+      if (!user?.email) return
+      setLoading(true)
+      try {
+        const row = await getRowByDealer(CFG.gasBase, idToken, user.email, dealerName, { includeCalls: true })
+        const callSlots = Array.isArray(row.callSlots) ? row.callSlots : []
+
+        let callN = 4
+        for (let i = 0; i < 4; i++) {
+          const v = String(callSlots[i] || '').trim()
+          if (!v) {
+            callN = i + 1
+            break
+          }
+        }
+
+        const remark = `Scheduled from OrderCycle (orderId=${schedule.order?.orderId || ''})`
+        const nowISO = todayISO || new Date().toISOString().slice(0, 10)
+
+        await postMarkNoCors(CFG.gasBase, {
+          path: 'mark',
+          id_token: idToken,
+          rowIndex: row.rowIndex,
+          date: nowISO,
+          outcome: 'SF',
+          remark,
+          callN,
+          plannedDate: nowISO,
+          scheduleAt,
+        })
+
+        showToast('SF scheduled')
+        closeSchedule()
+        await loadAll()
+      } catch (e) {
+        showToast(e?.message || 'Could not schedule call')
+      } finally {
+        setLoading(false)
+      }
+    },
+    [idToken, user?.email, schedule.order, todayISO, closeSchedule, loadAll, showToast],
+  )
+
+  const fetchSfRemarks = useCallback((clientName) => getSfRemarks(CFG.gasBase, idToken, clientName), [idToken])
+
+  if (!user) {
+    return (
+      <div className="appShell" style={{ display: 'grid', placeItems: 'center', minHeight: '100vh' }}>
+        <div className="panel" style={{ minHeight: 'auto', width: 'min(520px, 96vw)' }}>
+          <div className="panelHeader">
+            <div>
+              <h2>Sales Coordinator Login</h2>
+              <div className="muted">Sign in with your NT Woods Google account to continue.</div>
+            </div>
+          </div>
+          <div style={{ padding: 14 }}>
+            <GoogleSignIn clientId={CFG.clientId} onCredential={handleCredential} />
+          </div>
+        </div>
+        {loading ? <LoaderOverlay /> : null}
+        {toast ? <Toast msg={toast.msg} /> : null}
+      </div>
+    )
+  }
+
+  return (
+    <div className="appShell">
+      <header className="topbar">
+        <div className="brand">
+          <div className="logo">NT</div>
+          <div className="title">
+            <h1>SCOT Portal</h1>
+            <div className="muted">{todayISO ? formatDateLabel(todayISO) : ''}</div>
+          </div>
+        </div>
+
+        <div className="topbarRight">
+          <div className="badge">
+            <span>{dueItems.length}</span> Due
+          </div>
+          <div className="badge">
+            <span style={{ color: overdueCount ? 'var(--danger)' : 'inherit' }}>{overdueCount}</span> Overdue
+          </div>
+          <button className="btn btnLight" onClick={() => setQuickOrderOpen(true)}>
+            New Order
+          </button>
+          <div className="profile">
+            <img className="avatar" src={user.picture || ''} alt="" />
+            <div className="email" title={user.email}>
+              {user.email}
+            </div>
+            <button className="btn btnLight" onClick={signOut}>
+              Sign out
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div className="layout">
+        <section className="panel">
+          <div className="panelHeader">
+            <h2>Due Follow-ups</h2>
+            <div className="muted">Auto-refresh every 30s</div>
+          </div>
+          <div className="dueGrid">
+            {dueItems.length ? (
+              dueItems.map((it) => (
+                <DueCard
+                  key={it.rowIndex}
+                  item={it}
+                  todayISO={todayISO}
+                  onOpenCall={(dc) => openFollowup(it, dc)}
+                  fetchSfRemarks={fetchSfRemarks}
+                />
+              ))
+            ) : (
+              <div className="muted" style={{ padding: 8 }}>
+                No active follow-ups.
+              </div>
+            )}
+          </div>
+        </section>
+
+        <div className="rightColumn">
+          <div className="panel rightSection">
+            <OrdersPanel title="Orders Received" items={ordersReceived} onScheduleCall={openSchedule} />
+          </div>
+          <div className="panel rightSection big">
+            <OrdersPanel title="Orders in Process" items={ordersInProcess} onScheduleCall={openSchedule} />
+          </div>
+        </div>
+      </div>
+
+      {followup.open ? (
+        <FollowupModal
+          context={followup.context}
+          scEmail={user.email}
+          scName={user.name}
+          scIdToken={idToken}
+          orderPunchUrl={CFG.orderPunchUrl}
+          orderPunchOrigin={orderPunchOrigin}
+          onClose={closeFollowup}
+          onSubmit={handleMark}
+          onAutoMarkOR={handleAutoMarkOR}
+          onRemarkChange={(v) => {
+            followupRemarkRef.current = v
+          }}
+        />
+      ) : null}
+
+      {quickOrderOpen ? (
+        <QuickOrderModal
+          onClose={() => setQuickOrderOpen(false)}
+          scEmail={user.email}
+          scName={user.name}
+          scIdToken={idToken}
+          orderPunchUrl={CFG.orderPunchUrl}
+          orderPunchOrigin={orderPunchOrigin}
+          dealers={scotDealers}
+          onOrderPunched={handleQuickOrderPunched}
+        />
+      ) : null}
+
+      {schedule.open ? (
+        <ScheduleCallDialog
+          order={schedule.order}
+          dealers={scotDealers}
+          onClose={closeSchedule}
+          onSubmit={handleScheduleSubmit}
+        />
+      ) : null}
+
+      {loading ? <LoaderOverlay /> : null}
+      {toast ? <Toast key={toast.id} msg={toast.msg} /> : null}
+    </div>
+  )
+}
