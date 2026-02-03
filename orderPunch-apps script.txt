@@ -1,0 +1,220 @@
+/**
+ * Order Punch Backend (Apps Script)
+ * - Accept JSON body: dealerName, marketingPersonName, dealerLocation, files[]
+ * - Optional identity fields: punchedByEmail, punchedByName, id_token
+ * - Upload each file to Drive (public link)
+ * - Append a new row in OrderCycle (timestamp, dealer, mp, location, urls, status)
+ * - Generate sequential Order ID (NTW####) in column BD (56)
+ * - Write punchedByEmail to column BK (63) when available
+ * - Return JSON (CORS-enabled for GitHub Pages + local dev)
+ */
+
+// ====== CONFIG ======
+const FOLDER_ID_FOR_UPLOADS = '1-ueewz_kt-Q0uYgKqlx0DKg6tFcprVMO';
+const SHEET_ID  = '1WSQMXxEAWVqeSBcEiYPWZ8HAL5d9y0Rdcel6xupbTPI';
+const SHEET_NAME = 'OrderCycle';
+
+// Script Property key for order counter
+const ORDER_ID_PROP_KEY = 'CURRENT_ORDER_ID';
+
+const AUTH_CFG = {
+  DEFAULT_ORIGIN: 'https://ntwoods.github.io',
+  // Safe dev escape hatch: set Script Property DEV_ALLOW_ALL_ORIGINS=true
+  DEV_ALLOW_ALL_ORIGINS_PROP: 'DEV_ALLOW_ALL_ORIGINS',
+  // Keep in sync with your Google Identity client(s).
+  ALLOWED_AUDIENCES: [
+    '360849757137-agopfs0m8rgmcj541ucpg22btep5olt3.apps.googleusercontent.com'
+  ]
+};
+
+// ===== CORS & JSON =====
+function getAllowOrigin_(e) {
+  var originParam = (e && e.parameter && e.parameter.origin) ? String(e.parameter.origin) : '';
+  originParam = originParam.trim();
+  if (originParam) return originParam;
+
+  try {
+    var p = PropertiesService.getScriptProperties().getProperty(AUTH_CFG.DEV_ALLOW_ALL_ORIGINS_PROP);
+    if (String(p || '').toLowerCase() === 'true') return '*';
+  } catch (_) {}
+
+  return AUTH_CFG.DEFAULT_ORIGIN;
+}
+
+function applyCors_(output, origin) {
+  var allowOrigin = origin || AUTH_CFG.DEFAULT_ORIGIN;
+  return output
+    .setHeader('Access-Control-Allow-Origin', allowOrigin)
+    .setHeader('Vary', 'Origin')
+    .setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    .setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
+    .setHeader('Access-Control-Max-Age', '86400');
+}
+
+function doOptions(e) {
+  var origin = getAllowOrigin_(e);
+  var out = ContentService.createTextOutput('').setMimeType(ContentService.MimeType.TEXT);
+  return applyCors_(out, origin);
+}
+
+function jsonOK(obj)  {
+  return ContentService
+    .createTextOutput(JSON.stringify({ ok: true, ...(obj || {}) }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function jsonErr(msg) {
+  return ContentService
+    .createTextOutput(JSON.stringify({ ok: false, error: String(msg || 'error') }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function verifyIdToken_(idToken) {
+  if (!idToken) return null;
+  var r = UrlFetchApp.fetch(
+    'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(String(idToken)),
+    { muteHttpExceptions: true }
+  );
+  if (r.getResponseCode() !== 200) throw new Error('Invalid ID token');
+  var info = JSON.parse(r.getContentText() || '{}');
+  if (!AUTH_CFG.ALLOWED_AUDIENCES.includes(info.aud)) throw new Error('Audience mismatch');
+  if (!info.email_verified) throw new Error('Email not verified');
+  return {
+    email: String(info.email || '').toLowerCase(),
+    name: info.name || ''
+  };
+}
+
+// ===== Order ID Helper =====
+/**
+ * Har call pe next Order ID generate karega, 
+ * property update karega, aur "NTW1450" jaisa string return karega.
+ */
+function getNextOrderId_() {
+  const props = PropertiesService.getScriptProperties();
+  
+  // Yahan current number store hai (e.g. "1449")
+  // Agar pehli baar hai, to default 1449 rakha hai (so next will be 1450)
+  const currentStr = props.getProperty(ORDER_ID_PROP_KEY) || '1449';
+  const currentNum = Number(currentStr) || 0;
+  const nextNum = currentNum + 1;
+  
+  // NTW1450, NTW1451 ... (agar padding chahiye to neeche comment use kar sakte ho)
+  // const orderIdStr = 'NTW' + Utilities.formatString('%04d', nextNum); // NTW0001 style
+  const orderIdStr = 'NTW' + nextNum; // aapke example ke hisaab se: NTW1449, NTW1450
+
+  // property update
+  props.setProperty(ORDER_ID_PROP_KEY, String(nextNum));
+
+  return orderIdStr;
+}
+
+// (Optional) helper: ek baar run karke initial value set kar sakte ho
+function initOrderId_1449() {
+  PropertiesService.getScriptProperties().setProperty(ORDER_ID_PROP_KEY, '1449');
+}
+
+// ===== Handlers =====
+function doPost(e) {
+  var allowOrigin = getAllowOrigin_(e);
+
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      return applyCors_(jsonErr('Empty body'), allowOrigin);
+    }
+    const data = JSON.parse(e.postData.contents || '{}');
+
+    // Validate required fields
+    if (!data.dealerName || !data.marketingPersonName || !data.dealerLocation || !Array.isArray(data.files)) {
+      return applyCors_(jsonErr('Missing mandatory fields'), allowOrigin);
+    }
+
+    const dealerName          = data.dealerName;
+    const marketingPersonName = data.marketingPersonName;
+    const dealerLocation      = data.dealerLocation;
+    const files               = data.files;
+
+    // Identity (optional): prefer verified id_token as source of truth.
+    var verified = null;
+    try {
+      verified = verifyIdToken_(data.id_token);
+    } catch (authErr) {
+      return applyCors_(
+        jsonErr(authErr && authErr.message ? authErr.message : 'Invalid id_token'),
+        allowOrigin
+      );
+    }
+    var punchedByEmail = verified
+      ? verified.email
+      : String(data.punchedByEmail || '').trim().toLowerCase();
+    var punchedByName = verified
+      ? verified.name
+      : String(data.punchedByName || '').trim();
+
+    const folder   = DriveApp.getFolderById(FOLDER_ID_FOR_UPLOADS);
+    const fileUrls = [];
+
+    (files || []).forEach(file => {
+      const mimeType = (file && file.type) ? String(file.type) : MimeType.JPEG;
+      const name     = (file && file.name) ? String(file.name) : ('Upload_' + Date.now());
+      const base64   = (file && file.data) ? String(file.data) : ''; // `data` is base64 without prefix expected
+      if (!base64) return; // skip empty
+
+      const blob     = Utilities.newBlob(Utilities.base64Decode(base64), mimeType, name);
+      const uploaded = folder.createFile(blob);
+      uploaded.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      fileUrls.push(uploaded.getUrl());
+    });
+
+    const timestamp = new Date();
+    const sheet     = SpreadsheetApp.openById(SHEET_ID).getSheetByName(SHEET_NAME);
+    if (!sheet) return applyCors_(jsonErr('Sheet not found'), allowOrigin);
+
+    // 👉 yahan next Order ID generate kar rahe hain
+    const orderId = getNextOrderId_();  // e.g. "NTW1450"
+
+    const newRow = [
+      timestamp,              // Column A: Timestamp
+      dealerName,             // Column B
+      marketingPersonName,    // Column C
+      dealerLocation,         // Column D
+      fileUrls.join(', '),    // Column E (example)
+      "Pending"               // Column F (example)
+      // Aage ke columns blank rahenge, BD hum alag se set karenge
+    ];
+
+    sheet.appendRow(newRow);
+
+    // Abhi-abhi append hui row ka row number
+    const lastRow = sheet.getLastRow();
+
+    // Column BD = 56 (A=1 ... Z=26, AA=27 ... AZ=52, BA=53, BB=54, BC=55, BD=56)
+    const ORDER_ID_COL = 56;
+    sheet.getRange(lastRow, ORDER_ID_COL).setValue(orderId);
+
+    // Column BK = 63 (store punchedByEmail if available)
+    if (punchedByEmail) {
+      const PUNCHED_BY_EMAIL_COL = 63; // BK
+      sheet.getRange(lastRow, PUNCHED_BY_EMAIL_COL).setValue(punchedByEmail);
+    }
+
+    return applyCors_(
+      jsonOK({
+        status: 'success',
+        message: 'Data submitted successfully',
+        urls: fileUrls,
+        orderId: orderId,
+        punchedByEmail: punchedByEmail || '',
+        punchedByName: punchedByName || ''
+      }),
+      allowOrigin
+    );
+
+  } catch (error) {
+    Logger.log('Error in doPost: ' + error.toString());
+    return applyCors_(
+      jsonErr(error && error.message ? error.message : 'Internal server error'),
+      allowOrigin
+    );
+  }
+}

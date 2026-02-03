@@ -1,0 +1,763 @@
+/***************************************************
+ * SC Follow-ups Backend (Apps Script)
+ * - Handles SC follow-up due list + marking outcomes
+ * - Quick Mode helpers: scotDealers, addDealer, rowByDealer
+ ***************************************************/
+
+const CFG = {
+  SHEET_ID: '1e0WUcznBaVpJHfRxiFXe8qngm56jz7zK3pWnG3G7VJg',
+  SHEET_NAME: 'Sheet1',
+  ACTIVITY_LOG_SHEET: 'Activity_Log',
+  ORDER_CYCLE_SHEET_ID: '1WSQMXxEAWVqeSBcEiYPWZ8HAL5d9y0Rdcel6xupbTPI',
+  ORDER_CYCLE_SHEET_NAME: 'OrderCycle',
+  HEADERS_ROW: 3,
+  DATA_START_ROW: 4,
+  FIRST_DAY_COL: 15,   // O
+  LAST_DAY_COL: 45,    // AS
+  TIMEZONE: 'Asia/Kolkata',
+  ALLOWED_AUDIENCES: [
+    '360849757137-agopfs0m8rgmcj541ucpg22btep5olt3.apps.googleusercontent.com'
+  ],
+  DRIVE_FOLDER_NAME: 'SC_Orders'
+};
+
+/* ========== Utilities ========== */
+
+function ss_() {
+  return SpreadsheetApp.openById(CFG.SHEET_ID);
+}
+function sheet_() {
+  return ss_().getSheetByName(CFG.SHEET_NAME);
+}
+function logSheet_() {
+  const ss = ss_();
+  let sh = ss.getSheetByName(CFG.ACTIVITY_LOG_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(CFG.ACTIVITY_LOG_SHEET);
+    sh.appendRow([
+      'TS (IST)', 'SC Email', 'Client', 'RowIndex',
+      'Day(1-31)', 'MarkedA1', 'Outcome', 'Remark',
+      'ResolvedCall', 'OriginalCallDate',
+      'FollowUpPlanned', 'FollowUpActual', 'ActionFileURL', 'UserAgent'
+    ]);
+  }
+  return sh;
+}
+
+function J_(o) {
+  return ContentService
+    .createTextOutput(JSON.stringify(o))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+function ok_(p) {
+  return J_({ ok: true, ...p });
+}
+function bad_(m, c) {
+  return J_({ ok: false, error: String(m), code: c || 400 });
+}
+
+function todayIST_() {
+  const s = Utilities.formatDate(new Date(), CFG.TIMEZONE, 'yyyy-MM-dd');
+  return new Date(s + 'T00:00:00');
+}
+function toISO_(d) {
+  return Utilities.formatDate(d, CFG.TIMEZONE, 'yyyy-MM-dd');
+}
+function toISOdt_(d) {
+  return Utilities.formatDate(d, CFG.TIMEZONE, "yyyy-MM-dd'T'HH:mm:ss");
+}
+function parseISODate_(s) {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+function dateOnly_(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+function normEmail_(s) {
+  return String(s || '').trim().toLowerCase();
+}
+
+function verify_(idToken) {
+  if (!idToken) throw new Error('Missing id_token');
+  const r = UrlFetchApp.fetch(
+    'https://oauth2.googleapis.com/tokeninfo?id_token=' +
+    encodeURIComponent(idToken),
+    { muteHttpExceptions: true }
+  );
+  if (r.getResponseCode() !== 200) throw new Error('Invalid ID token');
+  const info = JSON.parse(r.getContentText());
+  if (!CFG.ALLOWED_AUDIENCES.includes(info.aud)) {
+    throw new Error('Audience mismatch');
+  }
+  if (!info.email_verified) throw new Error('Email not verified');
+  return {
+    email: (info.email || '').toLowerCase(),
+    name: info.name || '',
+    picture: info.picture || ''
+  };
+}
+
+// Mapping rules for OrderCycle punchedByEmail -> which SC user sees the order.
+function orderOwnerForPunchedBy_(punchedByEmail) {
+  const e = normEmail_(punchedByEmail);
+  if (e === 'crm01@ntwoods.com' || e === 'sc01@ntwoods.com') return 'sc01@ntwoods.com';
+  if (e === 'crm02@ntwoods.com') return 'crm02@ntwoods.com';
+  if (e === 'crm03@ntwoods.com') return 'crm03@ntwoods.com';
+  if (e === 'crm04@ntwoods.com' || e === 'sc02@ntwoods.com') return 'sc02@ntwoods.com';
+  return '';
+}
+
+function dayToCol_(day) {
+  return CFG.FIRST_DAY_COL + (day - 1);
+}
+function colA1_(col) {
+  return sheet_()
+    .getRange(1, col)
+    .getA1Notation()
+    .replace(/[0-9]/g, '');
+}
+function hasTime_(d) {
+  return (
+    d instanceof Date &&
+    !isNaN(d) &&
+    (d.getHours() + d.getMinutes() + d.getSeconds()) !== 0
+  );
+}
+
+function monthEndDate_(d) {
+  return new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999);
+}
+
+// Week buckets: 1–7, 8–14, 15–21, 22–monthEnd
+function weekEndFor_(d) {
+  const dd = d.getDate();
+  if (dd <= 7) return new Date(d.getFullYear(), d.getMonth(), 7, 23, 59, 59, 999);
+  if (dd <= 14) return new Date(d.getFullYear(), d.getMonth(), 14, 23, 59, 59, 999);
+  if (dd <= 21) return new Date(d.getFullYear(), d.getMonth(), 21, 23, 59, 59, 999);
+  return monthEndDate_(d);
+}
+
+function inRangeInclusive_(dateObj, start, end) {
+  const x = dateOnly_(dateObj).getTime();
+  return (
+    x >= dateOnly_(start).getTime() &&
+    x <= dateOnly_(end).getTime()
+  );
+}
+
+// Planned-date ko uski week-window ke andar settle maana jaye
+// (1–7 => 7, 8–14 => 14, 15–21 => 21, 22–EOM), par sirf aaj tak.
+function settledInWindow_(rowVals, plannedDateObj, todayObj) {
+  if (!(plannedDateObj instanceof Date)) return false;
+
+  // window [plannedDate .. min(bucketEnd(plannedDate), today)]
+  const start = dateOnly_(plannedDateObj);
+  const windowEnd = weekEndFor_(plannedDateObj);
+  const end = dateOnly_(
+    new Date(
+      Math.min(windowEnd.getTime(), dateOnly_(todayObj).getTime())
+    )
+  );
+
+  // Day columns O:AS => 1..31 map to FIRST_DAY_COL..LAST_DAY_COL
+  const startDay = Number(Utilities.formatDate(start, CFG.TIMEZONE, 'd')); // 1..31
+  const endDay = Number(Utilities.formatDate(end, CFG.TIMEZONE, 'd'));     // 1..31
+  const startIdx = dayToCol_(startDay) - 1; // zero-based for rowVals
+  const endIdx = dayToCol_(endDay) - 1;
+
+  for (let c = startIdx; c <= endIdx; c++) {
+    const val = String(rowVals[c] || '').trim();
+    if (val) {
+      // Day cell me SF hum kabhi nahi likhte; OR/NR/AI/MD hi aate hain.
+      return true; // settled
+    }
+  }
+  return false; // abhi tak is window me outcome nahi aaya
+}
+
+function clearFollowupsInRange_(rowIndex, startDate, endDate) {
+  const sh = sheet_();
+  const range = sh.getRange(rowIndex, 7, 1, 4); // G:J
+  const vals = range.getValues()[0];
+  let changed = false;
+
+  for (let i = 0; i < 4; i++) {
+    const v = vals[i];
+    if (v instanceof Date) {
+      if (inRangeInclusive_(v, startDate, endDate)) {
+        vals[i] = '';
+        changed = true;
+      }
+    }
+  }
+  if (changed) range.setValues([vals]);
+  return changed;
+}
+
+function insertFollowupAt_(rowIndex, dateObj) {
+  const sh = sheet_();
+  const range = sh.getRange(rowIndex, 7, 1, 4); // G:J
+  const vals = range.getValues()[0];
+
+  // First empty slot
+  for (let i = 0; i < 4; i++) {
+    if (!(vals[i] instanceof Date) && String(vals[i] || '').trim() === '') {
+      vals[i] = dateOnly_(dateObj);
+      range.setValues([vals]);
+      return true;
+    }
+  }
+  // Fallback to J
+  vals[3] = dateOnly_(dateObj);
+  range.setValues([vals]);
+  return true;
+}
+
+/* ========== GET Router ========== */
+
+function doGet(e) {
+  const path = (e && e.parameter && e.parameter.path || '').trim();
+  const idt = (e && e.parameter && e.parameter.id_token) || '';
+
+  // Auth'd whoami
+  if (!path || path === 'me') {
+    try {
+      return ok_({ user: verify_(idt) });
+    } catch (err) {
+      return bad_(err, 401);
+    }
+  }
+
+  // === SF REMARKS FETCHER ===
+  if (path === 'sfRemarks') {
+    try {
+      const client = String(e.parameter.client || '').trim();
+      if (!client) return bad_('client required', 400);
+
+      const log = logSheet_().getDataRange().getValues();
+      const out = [];
+
+      for (let r = 1; r < log.length; r++) {
+        const row = log[r];
+        const outcome = row[6];
+        if (outcome === 'SF' && row[2] === client) {
+          out.push({
+            ts: row[0],
+            remark: row[7] || ''
+          });
+        }
+      }
+
+      return ok_({ remarks: out });
+    } catch (err) {
+      return bad_(err, 500);
+    }
+  }
+
+  // OrderCycle summary (Orders Received / In Process)
+  if (path === 'orderCycleSummary') {
+    try {
+      const user = verify_(idt);
+
+      const ss = SpreadsheetApp.openById(CFG.ORDER_CYCLE_SHEET_ID);
+      const sh = ss.getSheetByName(CFG.ORDER_CYCLE_SHEET_NAME);
+      if (!sh) return bad_('OrderCycle sheet not found', 500);
+
+      const lastRow = sh.getLastRow();
+      if (lastRow < 2) return ok_({ received: [], inProcess: [] });
+
+      // Read A..BK (1..63) so we have A,B,D,E,F,Y,BD,BK in one hit.
+      const rng = sh.getRange(2, 1, lastRow - 1, 63);
+      const V = rng.getValues();
+
+      const received = [];
+      const inProcess = [];
+
+      for (let r = 0; r < V.length; r++) {
+        const row = V[r];
+        const ts = row[0];            // A
+        const dealerName = row[1];    // B
+        const location = row[3];      // D
+        const orderUrl = row[4];      // E
+        const statusF = String(row[5] || '').trim(); // F
+        const colY = String(row[24] || '').trim();   // Y
+        const orderId = String(row[55] || '').trim(); // BD
+        const punchedByEmail = normEmail_(row[62]);  // BK
+
+        const owner = orderOwnerForPunchedBy_(punchedByEmail);
+        if (!owner || owner !== user.email) continue;
+
+        const item = {
+          tsISO: (ts instanceof Date) ? toISOdt_(ts) : String(ts || ''),
+          dealerName: String(dealerName || '').trim(),
+          location: String(location || '').trim(),
+          orderUrl: String(orderUrl || '').trim(),
+          statusF,
+          orderId,
+          punchedByEmail
+        };
+
+        if (statusF === 'Pending') {
+          received.push(item);
+        } else if (statusF !== '-' && !colY) {
+          inProcess.push(item);
+        }
+      }
+
+      return ok_({ received, inProcess });
+    } catch (err) {
+      return bad_(err, 500);
+    }
+  }
+  
+  // Dealers by email (Quick mode dropdown)
+  if (path === 'scotDealers') {
+    try {
+      const email = String(e && e.parameter && e.parameter.email || '').trim();
+      if (!email) return bad_('email required', 400);
+
+      const sh = sheet_();
+      const V = sh.getDataRange().getValues(); // A=email, B=Dealer, D=Color
+      const dealers = [];
+      for (let r = CFG.DATA_START_ROW - 1; r < V.length; r++) {
+        const em = String(V[r][0] || '').trim().toLowerCase();
+        if (em === email.toLowerCase()) {
+          const d = V[r][1];
+          if (d) dealers.push(d);
+        }
+      }
+      const uniq = Array.from(new Set(dealers));
+      return ok_({ dealers: uniq });
+    } catch (err) {
+      return bad_(err, 500);
+    }
+  }
+
+  // Row lookup by (email, dealer)
+  if (path === 'rowByDealer') {
+    try {
+      const email = String(e && e.parameter && e.parameter.email || '').trim();
+      const dealer = String(e && e.parameter && e.parameter.dealer || '').trim();
+      const includeCalls = String(e && e.parameter && e.parameter.includeCalls || '').trim() === '1';
+      if (!email || !dealer) return bad_('email & dealer required', 400);
+
+      const sh = sheet_();
+      const V = sh.getDataRange().getValues(); // A=email, B=Dealer
+      let found = 0;
+      for (let r = CFG.DATA_START_ROW - 1; r < V.length; r++) {
+        const em = String(V[r][0] || '').trim().toLowerCase();
+        const dl = String(V[r][1] || '').trim().toLowerCase();
+        if (em === email.toLowerCase() && dl === dealer.toLowerCase()) {
+          found = r + 1; // 1-based row
+          break;
+        }
+      }
+      if (!found) return bad_('row not found', 404);
+
+      if (includeCalls) {
+        const calls = sh.getRange(found, 7, 1, 4).getValues()[0].map(v => {
+          if (v instanceof Date) return hasTime_(v) ? toISOdt_(v) : toISO_(v);
+          return String(v || '').trim();
+        });
+        return ok_({ rowIndex: found, callSlots: calls });
+      }
+
+      return ok_({ rowIndex: found });
+    } catch (err) {
+      return bad_(err, 500);
+    }
+  }
+
+  // Due list
+  if (path === 'due') return getDue_(idt);
+
+  return bad_('Unknown GET path', 404);
+}
+
+/* --- Previous remark till yesterday (for UI) --- */
+
+function lastRemarkFromRow_(rowVals, todayDay) {
+  // O:AS -> 15..45
+  if (todayDay <= 1) return { text: '', day: 0 };
+
+  const startIdx = CFG.FIRST_DAY_COL - 1;           // O index (0-based)
+  const endIdx = dayToCol_(todayDay - 1) - 1;       // yesterday col index
+
+  for (let c = endIdx; c >= startIdx; c--) {
+    const v = String(rowVals[c] || '').trim();
+    if (v) {
+      const day = (c - startIdx) + 1;               // 1..31
+      return { text: v, day };
+    }
+  }
+  return { text: '', day: 0 };
+}
+
+/* ========== POST Router ========== */
+
+function doPost(e) {
+  const raw = e && e.postData && e.postData.contents || '{}';
+  let body = {};
+  try { body = JSON.parse(raw); } catch (_) {}
+  const path = (body.path || (e && e.parameter && e.parameter.path) || '').trim();
+  const idt = body.id_token || (e && e.parameter && e.parameter.id_token) || '';
+
+  // Add Dealer (Quick mode)
+  if (path === 'addDealer') {
+    try {
+      const email = String(body.email || '').trim();
+      const dealerName = String(body.dealerName || '').trim();
+      const color = String(body.color || '').trim();
+      if (!email || !dealerName || !color) {
+        return bad_('email, dealerName, color required', 400);
+      }
+
+      const sh = sheet_();
+      const newRow = sh.getLastRow() + 1;
+      sh.getRange(newRow, 1, 1, 4).setValues([[email, dealerName, '', color]]);
+      return ok_({ rowIndex: newRow });
+    } catch (err) {
+      return bad_(err, 500);
+    }
+  }
+
+  // Mark outcome
+  if (path === 'mark') return postMark_(body, idt, e);
+
+  return bad_('Unknown POST path', 404);
+}
+
+/* ========== Due handler ========== */
+
+function getDue_(id_token) {
+  let user;
+  try {
+    user = verify_(id_token);
+  } catch (err) {
+    return bad_(err, 401);
+  }
+
+  const sh = sheet_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < CFG.DATA_START_ROW) {
+    return ok_({ items: [], today: toISO_(todayIST_()) });
+  }
+
+  const rng = sh.getRange(
+    CFG.DATA_START_ROW,
+    1,
+    lastRow - CFG.DATA_START_ROW + 1,
+    CFG.LAST_DAY_COL
+  );
+  const V = rng.getValues();
+
+  const today = todayIST_();
+  const todayISO = toISO_(today);
+  const todayDay = Number(Utilities.formatDate(today, CFG.TIMEZONE, 'd'));
+  const items = [];
+
+  for (let r = 0; r < V.length; r++) {
+    const row = V[r];
+    const email = String(row[0] || '').toLowerCase().trim(); // A
+    if (email !== user.email) continue;
+
+    const client = row[1];        // B
+    const clientColor = row[3];   // D
+    const g = row[6], h = row[7], i = row[8], j = row[9]; // G..J
+
+    // Build raw due calls (<= today) from G..J
+    const rawDue = [];
+    [[1, g], [2, h], [3, i], [4, j]].forEach(([n, d]) => {
+      if (d instanceof Date) {
+        const plannedISO = toISO_(d);
+        const plannedDateOnly = parseISODate_(plannedISO);
+        if (plannedDateOnly.getTime() <= today.getTime()) {
+          const sfAt = hasTime_(d) ? toISOdt_(d) : '';
+          rawDue.push({
+            callN: n,
+            callDate: plannedISO,
+            sfAt,
+            _dateObj: plannedDateOnly
+          });
+        }
+      }
+    });
+    if (!rawDue.length) continue;
+
+    // Window-aware settlement
+    const unsettled = rawDue.filter(dc =>
+      !settledInWindow_(row, dc._dateObj, today)
+    );
+    if (!unsettled.length) continue;
+
+    // Earliest future SF datetime for countdown
+    const sfFuture = [g, h, i, j]
+      .filter(x => hasTime_(x) && x.getTime() > new Date().getTime())
+      .sort((a, b) => a - b)[0];
+    const sfWhen = sfFuture ? toISOdt_(sfFuture) : '';
+
+    // Previous remark till yesterday (UI info only)
+    const { text: remarkText, day: remarkDay } =
+      lastRemarkFromRow_(row, todayDay);
+
+    items.push({
+      rowIndex: CFG.DATA_START_ROW + r,
+      clientName: client,
+      clientColor: clientColor,
+      dueCalls: unsettled.map(({ callN, callDate, sfAt }) => ({
+        callN, callDate, sfAt
+      })),
+      sfFuture: sfWhen,
+      todayColA1: colA1_(dayToCol_(todayDay)),
+      remarkText,
+      remarkDay
+    });
+  }
+
+  return ok_({ items, today: todayISO });
+}
+
+/* ========== Mark handler (SF / OR / NR / AI / AP / MD) ========== */
+
+function postMark_(body, id_token, e) {
+  let user;
+  try {
+    user = verify_(id_token);
+  } catch (err) {
+    return bad_(err, 401);
+  }
+
+  const rowIndex = Number(body.rowIndex);
+  const outcome = String(body.outcome || '').toUpperCase();
+  const remark = String(body.remark || '');
+  const plannedDate = String(body.plannedDate || '');  // ISO yyyy-mm-dd
+  const callN = Number(body.callN || 0);
+
+  if (!rowIndex || !outcome) return bad_('Missing fields');
+
+  const sh = sheet_();
+  const rowVals = sh.getRange(rowIndex, 1, 1, CFG.LAST_DAY_COL).getValues()[0];
+  const email = String(rowVals[0] || '').toLowerCase().trim();
+  if (email !== user.email) return bad_('Forbidden', 403);
+
+  // Day to mark (O..AS) only for OR/NR/AI/AP/MD
+  const markDayISO = String(body.date || '');
+  const markDay = markDayISO ? parseISODate_(markDayISO) : todayIST_();
+  const dayNum = Number(Utilities.formatDate(markDay, CFG.TIMEZONE, 'd'));
+  const dayCol = dayToCol_(dayNum);
+
+  let actionFileURL = '';
+  const nowTs = new Date();
+
+  /* ----- SF: Schedule Follow-up (only G:J set + log) ----- */
+
+  if (outcome === 'SF') {
+    if (!callN || !body.scheduleAt) {
+      return bad_('SF needs callN & scheduleAt');
+    }
+    const dt = new Date(String(body.scheduleAt)); // datetime-local from UI
+    const colNum = 7 + (callN - 1); // G=7, H=8, I=9, J=10
+    sh.getRange(rowIndex, colNum).setValue(dt);   // keep as Date-time
+
+    // Log only
+    logSheet_().appendRow([
+      Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
+      user.email, rowVals[1], rowIndex,
+      '', '', 'SF', remark,
+      callN || '', plannedDate || '',
+      plannedDate || '', Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
+      '', (e && e.parameter && e.parameter.ua) || ''
+    ]);
+
+    return ok_({ message: 'SF scheduled', rowIndex });
+  }
+
+  /* ----- MD: Owner restricted / no more follow-ups ----- */
+
+  if (outcome === 'MD') {
+    const cellText = remark ? 'MD: ' + remark : 'MD';
+
+    // Directly mark today’s column (no earlier-day guard)
+    sh.getRange(rowIndex, dayCol).setValue(cellText);
+
+    // Clear ALL follow-ups G:J
+    sh.getRange(rowIndex, 7, 1, 4).clearContent();
+
+    // Log
+    logSheet_().appendRow([
+      Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
+      user.email, rowVals[1], rowIndex,
+      dayNum, colA1_(dayCol) + rowIndex, 'MD', remark,
+      callN || '', plannedDate || '',
+      plannedDate || '', Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
+      '', (e && e.parameter && e.parameter.ua) || ''
+    ]);
+
+    return ok_({
+      message: 'MD recorded & follow-ups cleared',
+      a1: colA1_(dayCol) + rowIndex
+    });
+  }
+
+  /* ----- OR / NR / AI / AP ----- */
+
+  if (
+    outcome === 'OR' ||
+    outcome === 'NR' ||
+    outcome === 'AI' ||
+    outcome === 'AP'
+  ) {
+    // 1) Day-mark text at O..AS for today
+    const cellText = remark ? outcome + ': ' + remark : outcome;
+    sh.getRange(rowIndex, dayCol).setValue(cellText);
+
+    // 2) Clear followups in G:J and set future as per current logic
+    const D = dateOnly_(markDay);
+    // Clear (D+1 .. weekEnd(D+15)), then insert at D+15
+    const start = new Date(D); start.setDate(start.getDate() + 1);
+    const fif = new Date(D);   fif.setDate(fif.getDate() + 15);
+    const end = weekEndFor_(fif);
+    clearFollowupsInRange_(rowIndex, start, end);
+    insertFollowupAt_(rowIndex, fif);
+
+    // 3) Optional OR file upload
+    if (outcome === 'OR' && body.orFile && body.orFile.base64) {
+      const folder = ensureFolder_(CFG.DRIVE_FOLDER_NAME);
+      const blob = Utilities.newBlob(
+        Utilities.base64Decode(body.orFile.base64),
+        body.orFile.type || 'application/octet-stream',
+        body.orFile.name || ('Order_' + Date.now())
+      );
+      const f = folder.createFile(blob);
+      f.setSharing(
+        DriveApp.Access.ANYONE_WITH_LINK,
+        DriveApp.Permission.VIEW
+      );
+      actionFileURL = f.getUrl();
+    }
+
+    // 4) Activity log
+    logSheet_().appendRow([
+      Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
+      user.email, rowVals[1], rowIndex,
+      dayNum, colA1_(dayCol) + rowIndex, outcome, remark,
+      callN || '', plannedDate || '',
+      plannedDate || '', Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
+      actionFileURL, (e && e.parameter && e.parameter.ua) || ''
+    ]);
+
+    return ok_({
+      message: 'Marked',
+      a1: colA1_(dayCol) + rowIndex,
+      fileURL: actionFileURL
+    });
+  }
+
+  return bad_('Unsupported outcome');
+}
+
+/* ========== Drive helper ========== */
+
+function ensureFolder_(name) {
+  const it = DriveApp.getFoldersByName(name);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(name);
+}
+
+
+
+/* =========================
+   Monthly auto-reset (Sheet1 O:AS)
+   ========================= */
+
+function setupMonthlySheet1ResetTrigger() {
+  // Run once manually to create trigger
+  deleteTriggers_('runMonthlySheet1Reset');
+
+  ScriptApp.newTrigger('runMonthlySheet1Reset')
+    .timeBased()
+    .onMonthDay(1)     // every 1st day
+    .atHour(1)         // 01:00 AM IST (safe, midnight clashes avoid)
+    .nearMinute(10)
+    .create();
+}
+
+function runMonthlySheet1Reset() {
+  // idempotent: same month me dubara run na ho
+  const props = PropertiesService.getScriptProperties();
+  const now = todayIST_();
+  const key = Utilities.formatDate(now, CFG.TIMEZONE, 'yyyy-MM');
+
+  if (props.getProperty('SHEET1_LAST_RESET_YYYY_MM') === key) return;
+
+  resetSheet1ForNewMonth_();
+
+  props.setProperty('SHEET1_LAST_RESET_YYYY_MM', key);
+}
+
+function resetSheet1ForNewMonth_() {
+  const sh = sheet_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < CFG.DATA_START_ROW) return;
+
+  // 1) Clear day remarks for all data rows (O:AS)
+  const numRows = lastRow - CFG.DATA_START_ROW + 1;
+  const numCols = (CFG.LAST_DAY_COL - CFG.FIRST_DAY_COL + 1); // 31
+  sh.getRange(CFG.DATA_START_ROW, CFG.FIRST_DAY_COL, numRows, numCols).clearContent();
+
+  // 2) Auto-update day headers (dd-MMM) on the row that actually contains 01..31
+  const headerRow = detectDayHeaderRow_(sh);
+  const hdr = buildDayHeadersForThisMonth_(); // length 31
+  sh.getRange(headerRow, CFG.FIRST_DAY_COL, 1, 31).setValues([hdr]);
+
+  // Optional: if you want, you can also write the month label somewhere
+  // sh.getRange(headerRow - 1, CFG.FIRST_DAY_COL, 1, 1).setValue(Utilities.formatDate(todayIST_(), CFG.TIMEZONE, 'MMMM yyyy'));
+}
+
+function buildDayHeadersForThisMonth_() {
+  const now = todayIST_();
+  const y = now.getFullYear();
+  const m = now.getMonth(); // 0-based
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+
+  const out = [];
+  for (let d = 1; d <= 31; d++) {
+    if (d <= daysInMonth) {
+      const dt = new Date(y, m, d);
+      out.push(Utilities.formatDate(dt, CFG.TIMEZONE, 'dd-MMM')); // e.g., 01-Jan
+    } else {
+      out.push(''); // blank for non-existing dates (30/31)
+    }
+  }
+  return out;
+}
+
+function detectDayHeaderRow_(sh) {
+  // Try HEADERS_ROW first, otherwise one row above
+  const rA = safeGetDisp_(sh, CFG.HEADERS_ROW);
+  const rB = safeGetDisp_(sh, Math.max(1, CFG.HEADERS_ROW - 1));
+
+  const score = (arr) =>
+    arr.filter(x => String(x).trim().match(/^0?\d{1,2}(-[A-Za-z]{3})?$/)).length;
+
+  // Prefer the row where day-like headers are more
+  return score(rA) >= score(rB) ? CFG.HEADERS_ROW : Math.max(1, CFG.HEADERS_ROW - 1);
+}
+
+function safeGetDisp_(sh, rowNum) {
+  try {
+    return sh.getRange(rowNum, CFG.FIRST_DAY_COL, 1, 31).getDisplayValues()[0] || [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function deleteTriggers_(handlerName) {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction && t.getHandlerFunction() === handlerName) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+}
+
