@@ -68,10 +68,40 @@ function computeAutoFollowup_(todayISO, { days }) {
   }
 }
 
+function parseJwtPayload_(token) {
+  try {
+    const parts = String(token || '').split('.')
+    if (parts.length < 2) return null
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4)
+    const json = atob(padded)
+    return JSON.parse(json)
+  } catch {
+    return null
+  }
+}
+
+function mergeUniqueByRowIndex_(base, extra) {
+  const a = Array.isArray(base) ? base : []
+  const b = Array.isArray(extra) ? extra : []
+  if (!b.length) return a
+
+  const seen = new Set(a.map((x) => x?.rowIndex))
+  const out = a.slice()
+  for (const it of b) {
+    const k = it?.rowIndex
+    if (!k || seen.has(k)) continue
+    seen.add(k)
+    out.push(it)
+  }
+  return out
+}
+
 export default function App() {
   const [idToken, setIdToken] = useState('')
   const [user, setUser] = useState(null)
-  const [loading, setLoading] = useState(false)
+  const [blocking, setBlocking] = useState(false)
+  const [syncing, setSyncing] = useState(false)
   const [toast, setToast] = useState(null)
   const [lastSyncError, setLastSyncError] = useState('')
   const [debugPayload, setDebugPayload] = useState(null)
@@ -106,10 +136,11 @@ export default function App() {
   }, [])
 
   const loadAll = useCallback(
-    async ({ silent, fresh } = {}) => {
-      if (!idToken) return
+    async ({ silent, fresh, initial, token } = {}) => {
+      const tkn = token || idToken
+      if (!tkn) return
 
-      if (loadInflightRef.current && !fresh) return loadInflightRef.current
+      if (loadInflightRef.current && !fresh && !initial) return loadInflightRef.current
 
       try {
         loadAbortRef.current?.abort()
@@ -122,26 +153,67 @@ export default function App() {
       const reqId = Date.now()
       loadReqRef.current = reqId
 
-      if (!silent) setLoading(true)
+      if (!silent) setSyncing(true)
 
       const p = (async () => {
-        const [due, orderSummary] = await Promise.all([
-          getDue(CFG.gasBase, idToken, { signal: controller.signal, fresh }),
-          getOrderCycleSummary(CFG.gasBase, idToken, { signal: controller.signal, fresh }),
-        ])
+        const t0 = performance.now()
 
-        if (DEBUG) {
-          if (loadReqRef.current === reqId) setDebugPayload({ at: new Date().toISOString(), due, orderSummary })
-          console.debug('[SCOT] loadAll()', { due, orderSummary })
+        // 1) Fetch DUE first to unblock LCP ASAP, and to warm server-side token cache.
+        let due
+        try {
+          due = await getDue(CFG.gasBase, tkn, {
+            signal: controller.signal,
+            fresh,
+            limit: initial ? 12 : undefined,
+            cursor: undefined,
+          })
+        } catch (e) {
+          if (DEBUG) console.debug('[SCOT] due fetch failed', e)
+          throw e
         }
 
-        if (loadReqRef.current !== reqId) return
+        if (loadReqRef.current === reqId) {
+          setLastSyncError('')
+          setTodayISO(due?.today || due?.todayISO || '')
+          setDueItems(pickArray_(due, ['items', 'dueItems', 'due_items']))
+        }
 
-        setLastSyncError('')
-        setTodayISO(due?.today || due?.todayISO || '')
-        setDueItems(pickArray_(due, ['items', 'dueItems', 'due_items']))
-        setOrdersReceived(pickArray_(orderSummary, ['received', 'ordersReceived', 'orders_received']))
-        setOrdersInProcess(pickArray_(orderSummary, ['inProcess', 'in_process', 'ordersInProcess', 'orders_in_process']))
+        // If we only fetched the initial page, fill remaining due items in the background (non-blocking).
+        if (initial && Number(due?.nextCursor || 0) > 0) {
+          const startCursor = Number(due.nextCursor || 0)
+          void (async () => {
+            let cursor = startCursor
+            const pageLimit = 60
+            while (cursor) {
+              const page = await getDue(CFG.gasBase, tkn, {
+                signal: controller.signal,
+                fresh,
+                limit: pageLimit,
+                cursor,
+              })
+              if (loadReqRef.current !== reqId) return
+              const items = pickArray_(page, ['items', 'dueItems', 'due_items'])
+              if (items.length) setDueItems((prev) => mergeUniqueByRowIndex_(prev, items))
+              cursor = Number(page?.nextCursor || 0)
+            }
+          })().catch(() => {})
+        }
+
+        // 2) Fetch orders after due (not gating initial paint).
+        try {
+          const orderSummary = await getOrderCycleSummary(CFG.gasBase, tkn, { signal: controller.signal, fresh })
+          if (loadReqRef.current === reqId) {
+            setOrdersReceived(pickArray_(orderSummary, ['received', 'ordersReceived', 'orders_received']))
+            setOrdersInProcess(pickArray_(orderSummary, ['inProcess', 'in_process', 'ordersInProcess', 'orders_in_process']))
+          }
+
+          if (DEBUG && loadReqRef.current === reqId) {
+            setDebugPayload({ at: new Date().toISOString(), due, orderSummary })
+            console.debug('[SCOT] loadAll()', { due, orderSummary, ms: Math.round(performance.now() - t0) })
+          }
+        } catch (e) {
+          if (DEBUG) console.debug('[SCOT] orderCycleSummary fetch failed', e)
+        }
       })()
 
       loadInflightRef.current = p
@@ -158,7 +230,7 @@ export default function App() {
         if (loadInflightRef.current === p) loadInflightRef.current = null
         if (loadAbortRef.current === controller) loadAbortRef.current = null
 
-        if (!silent && loadReqRef.current === reqId) setLoading(false)
+        if (!silent && loadReqRef.current === reqId) setSyncing(false)
       }
     },
     [idToken, showToast],
@@ -176,19 +248,35 @@ export default function App() {
   const handleCredential = useCallback(
     async (credential) => {
       setIdToken(credential)
-      setLoading(true)
+      setBlocking(false)
       try {
-        const who = await getMe(CFG.gasBase, credential)
-        setUser(who.user)
-        const dealers = await getScotDealers(CFG.gasBase, who.user.email)
-        setScotDealers(dealers.dealers || [])
-        await loadAll({ fresh: true })
+        const payload = parseJwtPayload_(credential) || {}
+        const guessedUser = payload?.email
+          ? { email: payload.email, name: payload.name || '', picture: payload.picture || '' }
+          : null
+
+        if (guessedUser) setUser(guessedUser)
+        else {
+          // Fallback to server whoami (rare: malformed token)
+          const who = await getMe(CFG.gasBase, credential)
+          setUser(who.user)
+        }
+
+        // Fast-first initial fetch: due first (LCP), then orders; dealers can load after.
+        await loadAll({ fresh: true, initial: true, token: credential })
+
+        const email = guessedUser?.email || payload?.email || ''
+        if (email) {
+          getScotDealers(CFG.gasBase, email)
+            .then((dealers) => setScotDealers(dealers.dealers || []))
+            .catch(() => {})
+        }
       } catch (e) {
         setIdToken('')
         setUser(null)
         showToast(e?.message || 'Login failed')
       } finally {
-        setLoading(false)
+        setBlocking(false)
       }
     },
     [loadAll, showToast],
@@ -221,6 +309,8 @@ export default function App() {
     setFollowup({ open: false, context: null })
     setQuickOrderOpen(false)
     setSchedule({ open: false, order: null })
+    setBlocking(false)
+    setSyncing(false)
   }, [])
 
   const openFollowup = useCallback(
@@ -246,7 +336,7 @@ export default function App() {
       if (!ctx) return
       if (!outcome) return
 
-      setLoading(true)
+      setBlocking(true)
       try {
         const payload = {
           rowIndex: ctx.rowIndex,
@@ -265,7 +355,7 @@ export default function App() {
       } catch (e) {
         showToast(e?.message || 'Could not save')
       } finally {
-        setLoading(false)
+        setBlocking(false)
       }
     },
     [followup.context, idToken, closeFollowup, loadAll, showToast],
@@ -274,7 +364,7 @@ export default function App() {
   const handleAutoMarkOR = useCallback(async () => {
     const ctx = followup.context
     if (!ctx) return
-    setLoading(true)
+    setBlocking(true)
     try {
       const remark = followupRemarkRef.current || ''
       const payload = {
@@ -292,14 +382,14 @@ export default function App() {
     } catch (e) {
       showToast(e?.message || 'Could not record OR')
     } finally {
-      setLoading(false)
+      setBlocking(false)
     }
   }, [followup.context, idToken, closeFollowup, loadAll, showToast])
 
   const handleQuickOrderPunched = useCallback(
     async ({ dealerName }) => {
       if (!user?.email || !dealerName) return
-      setLoading(true)
+      setBlocking(true)
       try {
         const row = await getRowByDealer(CFG.gasBase, idToken, user.email, dealerName)
         const nowISO = todayISO || new Date().toISOString().slice(0, 10)
@@ -319,7 +409,7 @@ export default function App() {
       } catch (e) {
         showToast(e?.message || 'Could not auto-update')
       } finally {
-        setLoading(false)
+        setBlocking(false)
       }
     },
     [idToken, user?.email, todayISO, loadAll, showToast],
@@ -331,7 +421,7 @@ export default function App() {
   const handleScheduleSubmit = useCallback(
     async ({ dealerName }) => {
       if (!user?.email) return
-      setLoading(true)
+      setBlocking(true)
       try {
         const row = await getRowByDealer(CFG.gasBase, idToken, user.email, dealerName, { includeCalls: true })
         const callSlots = Array.isArray(row.callSlots) ? row.callSlots : []
@@ -367,7 +457,7 @@ export default function App() {
       } catch (e) {
         showToast(e?.message || 'Could not schedule call')
       } finally {
-        setLoading(false)
+        setBlocking(false)
       }
     },
     [idToken, user?.email, schedule.order, todayISO, closeSchedule, loadAll, showToast],
@@ -389,7 +479,7 @@ export default function App() {
             <GoogleSignIn clientId={CFG.clientId} onCredential={handleCredential} />
           </div>
         </div>
-        {loading ? <LoaderOverlay /> : null}
+        {blocking ? <LoaderOverlay /> : null}
         {toast ? <Toast msg={toast.msg} /> : null}
       </div>
     )
@@ -413,6 +503,7 @@ export default function App() {
           <div className="badge">
             <span style={{ color: overdueCount ? 'var(--danger)' : 'inherit' }}>{overdueCount}</span> Overdue
           </div>
+          {syncing ? <div className="muted" style={{ fontWeight: 800, fontSize: 12 }}>Syncing…</div> : null}
           <button className="btn btnLight" onClick={() => setQuickOrderOpen(true)}>
             New Order
           </button>
@@ -534,7 +625,7 @@ export default function App() {
         />
       ) : null}
 
-      {loading ? <LoaderOverlay /> : null}
+      {blocking ? <LoaderOverlay /> : null}
       {toast ? <Toast key={toast.id} msg={toast.msg} /> : null}
     </div>
   )
