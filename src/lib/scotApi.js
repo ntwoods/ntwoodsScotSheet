@@ -91,13 +91,19 @@ export async function getSfRemarks(gasBase, idToken, clientName, { signal, timeo
   return json.remarks || []
 }
 
-export async function getOrderCycleSummary(gasBase, idToken, { signal, timeoutMs, fresh } = {}) {
+export async function getOrderCycleSummary(
+  gasBase,
+  idToken,
+  { signal, timeoutMs, fresh, fast, windowRows } = {},
+) {
   assertCfg_(gasBase, idToken)
   const params = new URLSearchParams({
     path: 'orderCycleSummary',
     id_token: idToken,
   })
   if (fresh) params.set('fresh', '1')
+  if (fast) params.set('fast', '1')
+  if (Number.isFinite(Number(windowRows)) && Number(windowRows) > 0) params.set('windowRows', String(Number(windowRows)))
   const url = `${gasBase}?${params.toString()}`
   return jsonGet_(url, { signal, timeoutMs })
 }
