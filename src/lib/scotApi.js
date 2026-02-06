@@ -71,13 +71,15 @@ export async function getMe(gasBase, idToken, { signal, timeoutMs } = {}) {
   return jsonGet_(url, { signal, timeoutMs })
 }
 
-export async function getDue(gasBase, idToken, { signal, timeoutMs, fresh } = {}) {
+export async function getDue(gasBase, idToken, { signal, timeoutMs, fresh, limit, cursor } = {}) {
   assertCfg_(gasBase, idToken)
   const params = new URLSearchParams({
     path: 'due',
     id_token: idToken,
   })
   if (fresh) params.set('fresh', '1')
+  if (Number.isFinite(Number(limit)) && Number(limit) > 0) params.set('limit', String(Number(limit)))
+  if (Number.isFinite(Number(cursor)) && Number(cursor) > 0) params.set('cursor', String(Number(cursor)))
   const url = `${gasBase}?${params.toString()}`
   return jsonGet_(url, { signal, timeoutMs })
 }
