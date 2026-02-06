@@ -87,6 +87,9 @@ export default function App() {
   const [schedule, setSchedule] = useState({ open: false, order: null })
 
   const followupRemarkRef = useRef('')
+  const loadAbortRef = useRef(null)
+  const loadInflightRef = useRef(null)
+  const loadReqRef = useRef(0)
 
   const orderPunchOrigin = useMemo(() => {
     try {
@@ -103,31 +106,59 @@ export default function App() {
   }, [])
 
   const loadAll = useCallback(
-    async ({ silent } = {}) => {
+    async ({ silent, fresh } = {}) => {
       if (!idToken) return
-      if (!silent) setLoading(true)
+
+      if (loadInflightRef.current && !fresh) return loadInflightRef.current
+
       try {
+        loadAbortRef.current?.abort()
+      } catch {
+        // ignore
+      }
+
+      const controller = new AbortController()
+      loadAbortRef.current = controller
+      const reqId = Date.now()
+      loadReqRef.current = reqId
+
+      if (!silent) setLoading(true)
+
+      const p = (async () => {
         const [due, orderSummary] = await Promise.all([
-          getDue(CFG.gasBase, idToken),
-          getOrderCycleSummary(CFG.gasBase, idToken),
+          getDue(CFG.gasBase, idToken, { signal: controller.signal, fresh }),
+          getOrderCycleSummary(CFG.gasBase, idToken, { signal: controller.signal, fresh }),
         ])
 
         if (DEBUG) {
-          setDebugPayload({ at: new Date().toISOString(), due, orderSummary })
+          if (loadReqRef.current === reqId) setDebugPayload({ at: new Date().toISOString(), due, orderSummary })
           console.debug('[SCOT] loadAll()', { due, orderSummary })
         }
+
+        if (loadReqRef.current !== reqId) return
 
         setLastSyncError('')
         setTodayISO(due?.today || due?.todayISO || '')
         setDueItems(pickArray_(due, ['items', 'dueItems', 'due_items']))
         setOrdersReceived(pickArray_(orderSummary, ['received', 'ordersReceived', 'orders_received']))
         setOrdersInProcess(pickArray_(orderSummary, ['inProcess', 'in_process', 'ordersInProcess', 'orders_in_process']))
+      })()
+
+      loadInflightRef.current = p
+
+      try {
+        await p
       } catch (e) {
+        const isAbort = e?.name === 'AbortError' || String(e?.message || '').toLowerCase().includes('aborted')
+        if (isAbort) return
         const msg = e?.message || 'Sync failed'
-        setLastSyncError(msg)
+        if (loadReqRef.current === reqId) setLastSyncError(msg)
         if (!silent) showToast(msg)
       } finally {
-        if (!silent) setLoading(false)
+        if (loadInflightRef.current === p) loadInflightRef.current = null
+        if (loadAbortRef.current === controller) loadAbortRef.current = null
+
+        if (!silent && loadReqRef.current === reqId) setLoading(false)
       }
     },
     [idToken, showToast],
@@ -151,7 +182,7 @@ export default function App() {
         setUser(who.user)
         const dealers = await getScotDealers(CFG.gasBase, who.user.email)
         setScotDealers(dealers.dealers || [])
-        await loadAll()
+        await loadAll({ fresh: true })
       } catch (e) {
         setIdToken('')
         setUser(null)
@@ -170,6 +201,15 @@ export default function App() {
       // ignore
       void e
     }
+    try {
+      loadAbortRef.current?.abort()
+    } catch {
+      // ignore
+    }
+    loadAbortRef.current = null
+    loadInflightRef.current = null
+    loadReqRef.current = 0
+
     setIdToken('')
     setUser(null)
     setLastSyncError('')
@@ -221,7 +261,7 @@ export default function App() {
         await postMarkNoCors(CFG.gasBase, { path: 'mark', id_token: idToken, ...payload })
         showToast(`Saved: ${outcome}`)
         closeFollowup()
-        await loadAll()
+        await loadAll({ fresh: true })
       } catch (e) {
         showToast(e?.message || 'Could not save')
       } finally {
@@ -248,7 +288,7 @@ export default function App() {
       await postMarkNoCors(CFG.gasBase, { path: 'mark', id_token: idToken, ...payload })
       showToast('Saved: OR')
       closeFollowup()
-      await loadAll()
+      await loadAll({ fresh: true })
     } catch (e) {
       showToast(e?.message || 'Could not record OR')
     } finally {
@@ -275,7 +315,7 @@ export default function App() {
         })
         showToast('Order saved. Follow-ups updated.')
         setQuickOrderOpen(false)
-        await loadAll()
+        await loadAll({ fresh: true })
       } catch (e) {
         showToast(e?.message || 'Could not auto-update')
       } finally {
@@ -323,7 +363,7 @@ export default function App() {
 
         showToast('Follow-up scheduled (+15 days)')
         closeSchedule()
-        await loadAll()
+        await loadAll({ fresh: true })
       } catch (e) {
         showToast(e?.message || 'Could not schedule call')
       } finally {
