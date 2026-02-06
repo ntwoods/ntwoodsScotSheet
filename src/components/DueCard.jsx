@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { formatDHMS, normColor, weekWindowEnd } from '../lib/date.js'
 
 function colorHex_(c) {
@@ -22,7 +22,7 @@ function formatSFDate_(iso) {
     .replace(',', '')
 }
 
-export function DueCard({ item, todayISO, onOpenCall, fetchSfRemarks }) {
+export const DueCard = memo(function DueCard({ item, todayISO, onOpenCall, fetchSfRemarks }) {
   const [remarksOpen, setRemarksOpen] = useState(false)
   const [sfRemarks, setSfRemarks] = useState(null)
   const [remarksLoading, setRemarksLoading] = useState(false)
@@ -62,7 +62,8 @@ export function DueCard({ item, todayISO, onOpenCall, fetchSfRemarks }) {
       setCountdownOverdue(false)
     }
     tick()
-    const t = setInterval(tick, 1000)
+    // Avoid per-card 1s timers (can cause heavy main-thread work & bad perf metrics).
+    const t = setInterval(tick, 5000)
     return () => clearInterval(t)
   }, [item.sfFuture])
 
@@ -153,4 +154,4 @@ export function DueCard({ item, todayISO, onOpenCall, fetchSfRemarks }) {
       ) : null}
     </div>
   )
-}
+})
