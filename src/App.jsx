@@ -120,6 +120,7 @@ export default function App() {
   const loadAbortRef = useRef(null)
   const loadInflightRef = useRef(null)
   const loadReqRef = useRef(0)
+  const lastFullOrdersAtRef = useRef(0)
 
   const orderPunchOrigin = useMemo(() => {
     try {
@@ -201,7 +202,14 @@ export default function App() {
 
         // 2) Fetch orders after due (not gating initial paint).
         try {
-          const orderSummary = await getOrderCycleSummary(CFG.gasBase, tkn, { signal: controller.signal, fresh })
+          const orderSummary = await getOrderCycleSummary(CFG.gasBase, tkn, {
+            signal: controller.signal,
+            // Prefer fast window to paint orders quickly; fetch full occasionally in background.
+            fast: true,
+            windowRows: 2500,
+            // Avoid forcing nocache for fast calls (helps cold-ish loads too).
+            fresh: false,
+          })
           if (loadReqRef.current === reqId) {
             setOrdersReceived(pickArray_(orderSummary, ['received', 'ordersReceived', 'orders_received']))
             setOrdersInProcess(pickArray_(orderSummary, ['inProcess', 'in_process', 'ordersInProcess', 'orders_in_process']))
@@ -210,6 +218,23 @@ export default function App() {
           if (DEBUG && loadReqRef.current === reqId) {
             setDebugPayload({ at: new Date().toISOString(), due, orderSummary })
             console.debug('[SCOT] loadAll()', { due, orderSummary, ms: Math.round(performance.now() - t0) })
+          }
+
+          // Background full refresh (correctness): on initial load, or every ~5 min.
+          const now = Date.now()
+          const needFull = initial || now - (lastFullOrdersAtRef.current || 0) > 5 * 60 * 1000
+          if (needFull) {
+            void getOrderCycleSummary(CFG.gasBase, tkn, {
+              signal: controller.signal,
+              fresh,
+            })
+              .then((full) => {
+                if (loadReqRef.current !== reqId) return
+                setOrdersReceived(pickArray_(full, ['received', 'ordersReceived', 'orders_received']))
+                setOrdersInProcess(pickArray_(full, ['inProcess', 'in_process', 'ordersInProcess', 'orders_in_process']))
+                lastFullOrdersAtRef.current = now
+              })
+              .catch(() => {})
           }
         } catch (e) {
           if (DEBUG) console.debug('[SCOT] orderCycleSummary fetch failed', e)
