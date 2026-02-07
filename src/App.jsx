@@ -21,7 +21,7 @@ import { computeOverdueCount, formatDateLabel } from './lib/date.js'
 const CFG = {
   clientId: import.meta.env.VITE_CLIENT_ID,
   gasBase: import.meta.env.VITE_SCOT_GAS_BASE,
-  orderPunchUrl: import.meta.env.VITE_ORDER_PUNCH_URL || 'https://ntwoods.github.io/ordertodispatch/orderPunch.html',
+  orderPunchUrl: import.meta.env.VITE_ORDER_PUNCH_URL || 'orderPunch.html',
 }
 
 const DEBUG = (() => {
