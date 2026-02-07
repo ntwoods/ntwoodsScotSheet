@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ModalShell } from './ModalShell.jsx'
 
+function allowedIframeOrigins_(origin) {
+  const base = String(origin || '').trim()
+  const out = new Set()
+  if (base) out.add(base)
+  // Apps Script web apps often render from googleusercontent even when embedded via script.google.com URL.
+  if (base === 'https://script.google.com') out.add('https://script.googleusercontent.com')
+  if (base === 'https://script.googleusercontent.com') out.add('https://script.google.com')
+  return Array.from(out)
+}
+
 const OUTCOMES = [
   { value: 'OR', label: 'OR (Order Received)' },
   { value: 'SF', label: 'SF (Schedule Follow-up)' },
@@ -27,6 +37,7 @@ export function FollowupModal({
   const [remark, setRemark] = useState('')
   const [sfWhen, setSfWhen] = useState('')
   const iframeRef = useRef(null)
+  const iframeOrigins = useMemo(() => allowedIframeOrigins_(orderPunchOrigin), [orderPunchOrigin])
 
   useEffect(() => {
     onRemarkChange?.('')
@@ -45,6 +56,7 @@ export function FollowupModal({
     params.set('scEmail', scEmail || '')
     params.set('scName', scName || '')
     params.set('scIdToken', scIdToken || '')
+    params.set('parentOrigin', window.location.origin)
 
     // Attach context so the iframe can echo it back in ORDER_PUNCHED.meta.
     params.set('rowIndex', String(context.rowIndex || ''))
@@ -58,22 +70,27 @@ export function FollowupModal({
   const sendIframeInit = useCallback(() => {
     if (outcome !== 'OR' || !context) return
     try {
-      iframeRef.current?.contentWindow?.postMessage({ type: 'DEALERS_INIT', dealers: dealers || [], email: scEmail }, orderPunchOrigin)
-      iframeRef.current?.contentWindow?.postMessage(
-        { type: 'USER_CONTEXT', email: scEmail, name: scName, id_token: scIdToken },
-        orderPunchOrigin,
-      )
+      for (const targetOrigin of iframeOrigins) {
+        iframeRef.current?.contentWindow?.postMessage(
+          { type: 'DEALERS_INIT', dealers: dealers || [], email: scEmail },
+          targetOrigin,
+        )
+        iframeRef.current?.contentWindow?.postMessage(
+          { type: 'USER_CONTEXT', email: scEmail, name: scName, id_token: scIdToken },
+          targetOrigin,
+        )
+      }
     } catch (err) {
       // ignore
       void err
     }
-  }, [context, dealers, orderPunchOrigin, outcome, scEmail, scIdToken, scName])
+  }, [context, dealers, iframeOrigins, outcome, scEmail, scIdToken, scName])
 
   useEffect(() => {
     if (outcome !== 'OR' || !context) return
 
     const onMessage = (ev) => {
-      if (ev.origin !== orderPunchOrigin) return
+      if (!iframeOrigins.includes(ev.origin)) return
       const msg = ev.data || {}
       if (msg.type !== 'ORDER_PUNCHED' && msg.type !== 'SUCCESS') return
 
@@ -94,7 +111,7 @@ export function FollowupModal({
 
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [outcome, context, orderPunchOrigin, onAutoMarkOR])
+  }, [outcome, context, iframeOrigins, onAutoMarkOR])
 
   useEffect(() => {
     // If dealers arrive after the iframe loads, re-send init.
