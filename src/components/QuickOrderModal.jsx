@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef } from 'react'
 import { ModalShell } from './ModalShell.jsx'
 
+function allowedIframeOrigins_(origin) {
+  const base = String(origin || '').trim()
+  const out = new Set()
+  if (base) out.add(base)
+  // Apps Script web apps often render from googleusercontent even when embedded via script.google.com URL.
+  if (base === 'https://script.google.com') out.add('https://script.googleusercontent.com')
+  if (base === 'https://script.googleusercontent.com') out.add('https://script.google.com')
+  return Array.from(out)
+}
+
 export function QuickOrderModal({
   onClose,
   scEmail,
@@ -12,6 +22,7 @@ export function QuickOrderModal({
   onOrderPunched,
 }) {
   const iframeRef = useRef(null)
+  const iframeOrigins = useMemo(() => allowedIframeOrigins_(orderPunchOrigin), [orderPunchOrigin])
 
   const iframeSrc = useMemo(() => {
     const url = new URL(orderPunchUrl, window.location.href)
@@ -21,22 +32,31 @@ export function QuickOrderModal({
     params.set('scEmail', scEmail || '')
     params.set('scName', scName || '')
     params.set('scIdToken', scIdToken || '')
+    params.set('parentOrigin', window.location.origin)
     return url.toString()
   }, [orderPunchUrl, scEmail, scName, scIdToken])
 
   const sendIframeInit = useCallback(() => {
     try {
-      iframeRef.current?.contentWindow?.postMessage({ type: 'DEALERS_INIT', dealers: dealers || [], email: scEmail }, orderPunchOrigin)
-      iframeRef.current?.contentWindow?.postMessage({ type: 'USER_CONTEXT', email: scEmail, name: scName, id_token: scIdToken }, orderPunchOrigin)
+      for (const targetOrigin of iframeOrigins) {
+        iframeRef.current?.contentWindow?.postMessage(
+          { type: 'DEALERS_INIT', dealers: dealers || [], email: scEmail },
+          targetOrigin,
+        )
+        iframeRef.current?.contentWindow?.postMessage(
+          { type: 'USER_CONTEXT', email: scEmail, name: scName, id_token: scIdToken },
+          targetOrigin,
+        )
+      }
     } catch (err) {
       // ignore
       void err
     }
-  }, [dealers, orderPunchOrigin, scEmail, scIdToken, scName])
+  }, [dealers, iframeOrigins, scEmail, scIdToken, scName])
 
   useEffect(() => {
     const onMessage = (ev) => {
-      if (ev.origin !== orderPunchOrigin) return
+      if (!iframeOrigins.includes(ev.origin)) return
       const msg = ev.data || {}
       if (msg.type !== 'ORDER_PUNCHED' && msg.type !== 'SUCCESS') return
 
@@ -47,7 +67,7 @@ export function QuickOrderModal({
     }
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [onClose, orderPunchOrigin, onOrderPunched])
+  }, [iframeOrigins, onClose, onOrderPunched])
 
   useEffect(() => {
     // If dealers arrive after the iframe loads, re-send init.
