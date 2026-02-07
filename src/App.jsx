@@ -124,9 +124,9 @@ export default function App() {
 
   const orderPunchOrigin = useMemo(() => {
     try {
-      return new URL(CFG.orderPunchUrl).origin
+      return new URL(CFG.orderPunchUrl, window.location.href).origin
     } catch {
-      return 'https://ntwoods.github.io'
+      return window.location.origin
     }
   }, [])
 
@@ -401,6 +401,7 @@ export default function App() {
         plannedDate: ctx.callDate || ctx.dateISO,
       }
       await postMarkNoCors(CFG.gasBase, { path: 'mark', id_token: idToken, ...payload })
+      setDueItems((prev) => prev.filter((it) => Number(it?.rowIndex || 0) !== Number(ctx.rowIndex || 0)))
       showToast('Saved: OR')
       closeFollowup()
       await loadAll({ fresh: true })
@@ -429,7 +430,6 @@ export default function App() {
           plannedDate: nowISO,
         })
         showToast('Order saved. Follow-ups updated.')
-        setQuickOrderOpen(false)
         await loadAll({ fresh: true })
       } catch (e) {
         showToast(e?.message || 'Could not auto-update')
@@ -619,6 +619,7 @@ export default function App() {
           scIdToken={idToken}
           orderPunchUrl={CFG.orderPunchUrl}
           orderPunchOrigin={orderPunchOrigin}
+          dealers={scotDealers}
           onClose={closeFollowup}
           onSubmit={handleMark}
           onAutoMarkOR={handleAutoMarkOR}
