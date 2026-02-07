@@ -30,7 +30,6 @@ export function FollowupModal({
   dealers,
   onClose,
   onSubmit,
-  onAutoMarkOR,
   onRemarkChange,
 }) {
   const [outcome, setOutcome] = useState('')
@@ -38,6 +37,7 @@ export function FollowupModal({
   const [sfWhen, setSfWhen] = useState('')
   const iframeRef = useRef(null)
   const iframeOrigins = useMemo(() => allowedIframeOrigins_(orderPunchOrigin), [orderPunchOrigin])
+  const [orderPunched, setOrderPunched] = useState(false)
 
   useEffect(() => {
     onRemarkChange?.('')
@@ -100,18 +100,17 @@ export function FollowupModal({
       const metaCall = Number(meta.callN || 0)
       const metaPlanned = String(meta.plannedDate || '').trim()
 
-      // Backwards/forwards compatible: if meta is missing, still accept the success signal
-      // (we only render this iframe for a single client context at a time).
       if (metaRow && metaRow !== Number(context.rowIndex)) return
       if (metaCall && metaCall !== Number(context.callN)) return
       if (metaPlanned && context.callDate && metaPlanned !== String(context.callDate)) return
 
-      onAutoMarkOR?.()
+      // We do NOT auto-mark OR anymore. This only updates the UI indicator to guide the user.
+      setOrderPunched(true)
     }
 
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
-  }, [outcome, context, iframeOrigins, onAutoMarkOR])
+  }, [outcome, context, iframeOrigins])
 
   useEffect(() => {
     // If dealers arrive after the iframe loads, re-send init.
@@ -131,8 +130,7 @@ export function FollowupModal({
       <button
         className="btn btnPrimary"
         onClick={() => onSubmit({ outcome, remark, scheduleAt: sfWhen })}
-        disabled={!outcome || outcome === 'OR' || (outcome === 'SF' && !sfWhen)}
-        title={outcome === 'OR' ? 'Submit inside the embedded Order Punch form' : undefined}
+        disabled={!outcome || (outcome === 'SF' && !sfWhen)}
       >
         Submit
       </button>
@@ -143,7 +141,13 @@ export function FollowupModal({
     <ModalShell title={`Follow-up for ${context.clientName}`} onClose={onClose} actions={actions}>
       <div className="field">
         <label>Outcome</label>
-        <select value={outcome} onChange={(e) => setOutcome(e.target.value)}>
+        <select
+          value={outcome}
+          onChange={(e) => {
+            setOutcome(e.target.value)
+            setOrderPunched(false)
+          }}
+        >
           <option value="" disabled>
             Select an option
           </option>
@@ -158,7 +162,10 @@ export function FollowupModal({
       {outcome === 'OR' ? (
           <div className="field">
             <label>Order Punch</label>
-            <div className="hint">Submit the embedded form below. On success, OR is recorded automatically.</div>
+            <div className="hint">
+              Step 1: submit the order in the embedded form. Step 2: click <b>Submit</b> above to mark OR in Activity_Log.
+              {orderPunched ? <span style={{ marginLeft: 8, fontWeight: 800 }}>(Order submitted)</span> : null}
+            </div>
             <div className="iframeHost" style={{ marginTop: 10 }}>
               <iframe
                 ref={iframeRef}
