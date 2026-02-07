@@ -116,7 +116,6 @@ export default function App() {
   const [quickOrderOpen, setQuickOrderOpen] = useState(false)
   const [schedule, setSchedule] = useState({ open: false, order: null })
 
-  const followupRemarkRef = useRef('')
   const loadAbortRef = useRef(null)
   const loadInflightRef = useRef(null)
   const loadReqRef = useRef(0)
@@ -347,7 +346,6 @@ export default function App() {
         callDate: dueCall.callDate,
         dateISO: todayISO,
       }
-      followupRemarkRef.current = ''
       setFollowup({ open: true, context: ctx })
     },
     [todayISO],
@@ -385,32 +383,6 @@ export default function App() {
     },
     [followup.context, idToken, closeFollowup, loadAll, showToast],
   )
-
-  const handleAutoMarkOR = useCallback(async () => {
-    const ctx = followup.context
-    if (!ctx) return
-    setBlocking(true)
-    try {
-      const remark = followupRemarkRef.current || ''
-      const payload = {
-        rowIndex: ctx.rowIndex,
-        date: ctx.dateISO,
-        outcome: 'OR',
-        remark,
-        callN: ctx.callN,
-        plannedDate: ctx.callDate || ctx.dateISO,
-      }
-      await postMarkNoCors(CFG.gasBase, { path: 'mark', id_token: idToken, ...payload })
-      setDueItems((prev) => prev.filter((it) => Number(it?.rowIndex || 0) !== Number(ctx.rowIndex || 0)))
-      showToast('Saved: OR')
-      closeFollowup()
-      await loadAll({ fresh: true })
-    } catch (e) {
-      showToast(e?.message || 'Could not record OR')
-    } finally {
-      setBlocking(false)
-    }
-  }, [followup.context, idToken, closeFollowup, loadAll, showToast])
 
   const handleQuickOrderPunched = useCallback(
     async ({ dealerName }) => {
@@ -622,10 +594,6 @@ export default function App() {
           dealers={scotDealers}
           onClose={closeFollowup}
           onSubmit={handleMark}
-          onAutoMarkOR={handleAutoMarkOR}
-          onRemarkChange={(v) => {
-            followupRemarkRef.current = v
-          }}
         />
       ) : null}
 
