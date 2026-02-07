@@ -132,7 +132,10 @@ export async function postMarkNoCors(gasBase, body) {
   await fetch(gasBase, {
     method: 'POST',
     mode: 'no-cors',
-    headers: { 'Content-Type': 'application/json' },
+    // In `no-cors` mode, only CORS-safelisted content-types are allowed. Apps Script reads `postData.contents`
+    // regardless, so use a simple request to maximize delivery reliability.
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    keepalive: true,
     body: JSON.stringify(body),
   })
 }
