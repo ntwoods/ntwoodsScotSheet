@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ModalShell } from './ModalShell.jsx'
 
 const OUTCOMES = [
@@ -17,6 +17,7 @@ export function FollowupModal({
   scIdToken,
   orderPunchUrl,
   orderPunchOrigin,
+  dealers,
   onClose,
   onSubmit,
   onAutoMarkOR,
@@ -25,6 +26,7 @@ export function FollowupModal({
   const [outcome, setOutcome] = useState('')
   const [remark, setRemark] = useState('')
   const [sfWhen, setSfWhen] = useState('')
+  const iframeRef = useRef(null)
 
   useEffect(() => {
     onRemarkChange?.('')
@@ -33,18 +35,39 @@ export function FollowupModal({
   const iframeSrc = useMemo(() => {
     if (!context || outcome !== 'OR') return ''
 
-    const params = new URLSearchParams({
-      fromScot: '1',
-      scEmail: scEmail || '',
-      scName: scName || '',
-      scIdToken: scIdToken || '',
-      rowIndex: String(context.rowIndex || ''),
-      callN: String(context.callN || ''),
-      plannedDate: String(context.callDate || ''),
-      clientName: String(context.clientName || ''),
-    })
-    return `${orderPunchUrl}?${params.toString()}`
+    const url = new URL(orderPunchUrl, window.location.href)
+    const params = url.searchParams
+
+    // Always force quick mode for consistent dealer UX inside SCOT.
+    params.set('variant', 'quick')
+
+    params.set('fromScot', '1')
+    params.set('scEmail', scEmail || '')
+    params.set('scName', scName || '')
+    params.set('scIdToken', scIdToken || '')
+
+    // Attach context so the iframe can echo it back in ORDER_PUNCHED.meta.
+    params.set('rowIndex', String(context.rowIndex || ''))
+    params.set('callN', String(context.callN || ''))
+    params.set('plannedDate', String(context.callDate || ''))
+    params.set('clientName', String(context.clientName || ''))
+
+    return url.toString()
   }, [context, outcome, orderPunchUrl, scEmail, scName, scIdToken])
+
+  const sendIframeInit = useCallback(() => {
+    if (outcome !== 'OR' || !context) return
+    try {
+      iframeRef.current?.contentWindow?.postMessage({ type: 'DEALERS_INIT', dealers: dealers || [], email: scEmail }, orderPunchOrigin)
+      iframeRef.current?.contentWindow?.postMessage(
+        { type: 'USER_CONTEXT', email: scEmail, name: scName, id_token: scIdToken },
+        orderPunchOrigin,
+      )
+    } catch (err) {
+      // ignore
+      void err
+    }
+  }, [context, dealers, orderPunchOrigin, outcome, scEmail, scIdToken, scName])
 
   useEffect(() => {
     if (outcome !== 'OR' || !context) return
@@ -52,15 +75,18 @@ export function FollowupModal({
     const onMessage = (ev) => {
       if (ev.origin !== orderPunchOrigin) return
       const msg = ev.data || {}
-      if (msg.type !== 'ORDER_PUNCHED') return
+      if (msg.type !== 'ORDER_PUNCHED' && msg.type !== 'SUCCESS') return
 
-      const meta = msg.meta || {}
+      const payload = msg.payload || msg
+      const meta = payload.meta || {}
       const metaRow = Number(meta.rowIndex || 0)
       const metaCall = Number(meta.callN || 0)
       const metaPlanned = String(meta.plannedDate || '').trim()
 
-      if (!metaRow || metaRow !== Number(context.rowIndex)) return
-      if (!metaCall || metaCall !== Number(context.callN)) return
+      // Backwards/forwards compatible: if meta is missing, still accept the success signal
+      // (we only render this iframe for a single client context at a time).
+      if (metaRow && metaRow !== Number(context.rowIndex)) return
+      if (metaCall && metaCall !== Number(context.callN)) return
       if (metaPlanned && context.callDate && metaPlanned !== String(context.callDate)) return
 
       onAutoMarkOR?.()
@@ -69,6 +95,12 @@ export function FollowupModal({
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
   }, [outcome, context, orderPunchOrigin, onAutoMarkOR])
+
+  useEffect(() => {
+    // If dealers arrive after the iframe loads, re-send init.
+    if (outcome !== 'OR' || !context) return
+    sendIframeInit()
+  }, [outcome, context, sendIframeInit])
 
   if (!context) return null
 
@@ -107,13 +139,20 @@ export function FollowupModal({
       </div>
 
       {outcome === 'OR' ? (
-        <div className="field">
-          <label>Order Punch</label>
-          <div className="hint">Submit the embedded form below. On success, OR is recorded automatically.</div>
-          <div className="iframeHost" style={{ marginTop: 10 }}>
-            <iframe title="Order Punch" src={iframeSrc} loading="lazy" referrerPolicy="no-referrer" />
+          <div className="field">
+            <label>Order Punch</label>
+            <div className="hint">Submit the embedded form below. On success, OR is recorded automatically.</div>
+            <div className="iframeHost" style={{ marginTop: 10 }}>
+              <iframe
+                ref={iframeRef}
+                title="Order Punch"
+                src={iframeSrc}
+                loading="lazy"
+                referrerPolicy="no-referrer"
+                onLoad={sendIframeInit}
+              />
+            </div>
           </div>
-        </div>
       ) : null}
 
       {outcome === 'SF' ? (
