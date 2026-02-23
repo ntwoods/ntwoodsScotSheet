@@ -7,6 +7,7 @@ import { QuickOrderModal } from './components/QuickOrderModal.jsx'
 import { ScheduleCallDialog } from './components/ScheduleCallDialog.jsx'
 import { LoaderOverlay } from './components/LoaderOverlay.jsx'
 import { Toast } from './components/Toast.jsx'
+import { DEFAULT_ORDER_POST_URL } from './lib/orderPunchApi.js'
 import {
   getDue,
   getMe,
@@ -21,7 +22,7 @@ import { computeOverdueCount, formatDateLabel } from './lib/date.js'
 const CFG = {
   clientId: import.meta.env.VITE_CLIENT_ID,
   gasBase: import.meta.env.VITE_SCOT_GAS_BASE,
-  orderPunchUrl: import.meta.env.VITE_ORDER_PUNCH_URL || 'orderPunch.html',
+  orderPunchPostUrl: import.meta.env.VITE_ORDER_PUNCH_POST_URL || DEFAULT_ORDER_POST_URL,
 }
 
 const DEBUG = (() => {
@@ -120,14 +121,6 @@ export default function App() {
   const loadInflightRef = useRef(null)
   const loadReqRef = useRef(0)
   const lastFullOrdersAtRef = useRef(0)
-
-  const orderPunchOrigin = useMemo(() => {
-    try {
-      return new URL(CFG.orderPunchUrl, window.location.href).origin
-    } catch {
-      return window.location.origin
-    }
-  }, [])
 
   const overdueCount = useMemo(() => computeOverdueCount(dueItems, todayISO), [dueItems, todayISO])
 
@@ -343,6 +336,7 @@ export default function App() {
         rowIndex: item.rowIndex,
         callN: dueCall.callN,
         clientName: item.clientName,
+        dealerName: item.clientName,
         callDate: dueCall.callDate,
         dateISO: todayISO,
       }
@@ -410,6 +404,37 @@ export default function App() {
       }
     },
     [idToken, user?.email, todayISO, loadAll, showToast],
+  )
+
+  const handleOrderSubmittedFromFollowup = useCallback(
+    async ({ remark }) => {
+      const ctx = followup.context
+      if (!ctx) return
+
+      closeFollowup()
+      setBlocking(true)
+      try {
+        await postMarkNoCors(CFG.gasBase, {
+          path: 'mark',
+          id_token: idToken,
+          rowIndex: ctx.rowIndex,
+          date: ctx.dateISO,
+          outcome: 'OR',
+          remark: remark || '',
+          callN: ctx.callN,
+          plannedDate: ctx.callDate || ctx.dateISO,
+        })
+      } catch (e) {
+        showToast(`Order submitted, but OR update failed: ${e?.message || 'Unknown error'}`)
+      } finally {
+        try {
+          await loadAll({ fresh: true })
+        } finally {
+          setBlocking(false)
+        }
+      }
+    },
+    [followup.context, closeFollowup, idToken, loadAll, showToast],
   )
 
   const openSchedule = useCallback((order) => setSchedule({ open: true, order }), [])
@@ -500,7 +525,7 @@ export default function App() {
           <div className="badge">
             <span style={{ color: overdueCount ? 'var(--danger)' : 'inherit' }}>{overdueCount}</span> Overdue
           </div>
-          {syncing ? <div className="muted" style={{ fontWeight: 800, fontSize: 12 }}>Syncing…</div> : null}
+          {syncing ? <div className="muted" style={{ fontWeight: 800, fontSize: 12 }}>Syncing...</div> : null}
           <button className="btn btnLight" onClick={() => setQuickOrderOpen(true)}>
             New Order
           </button>
@@ -552,10 +577,10 @@ export default function App() {
 
         <div className="rightColumn">
           <div className="panel rightSection">
-            <OrdersPanel title="Orders Received" items={ordersReceived} onScheduleCall={openSchedule} />
+            <OrdersPanel title="Orders Received" items={ordersReceived} onScheduleCall={openSchedule} onNotify={showToast} />
           </div>
           <div className="panel rightSection big">
-            <OrdersPanel title="Orders in Process" items={ordersInProcess} onScheduleCall={openSchedule} />
+            <OrdersPanel title="Orders in Process" items={ordersInProcess} onScheduleCall={openSchedule} onNotify={showToast} />
           </div>
           {DEBUG ? (
             <details className="panel" style={{ marginTop: 12, padding: 12 }}>
@@ -564,7 +589,7 @@ export default function App() {
                 {JSON.stringify(
                   {
                     user: { email: user?.email, name: user?.name },
-                    cfg: { gasBase: CFG.gasBase, orderPunchUrl: CFG.orderPunchUrl },
+                    cfg: { gasBase: CFG.gasBase, orderPunchPostUrl: CFG.orderPunchPostUrl },
                     counts: {
                       due: dueItems.length,
                       received: ordersReceived.length,
@@ -589,11 +614,13 @@ export default function App() {
           scEmail={user.email}
           scName={user.name}
           scIdToken={idToken}
-          orderPunchUrl={CFG.orderPunchUrl}
-          orderPunchOrigin={orderPunchOrigin}
           dealers={scotDealers}
+          gasBase={CFG.gasBase}
+          orderPostUrl={CFG.orderPunchPostUrl}
           onClose={closeFollowup}
           onSubmit={handleMark}
+          onOrderSubmitted={handleOrderSubmittedFromFollowup}
+          onToast={showToast}
         />
       ) : null}
 
@@ -603,10 +630,11 @@ export default function App() {
           scEmail={user.email}
           scName={user.name}
           scIdToken={idToken}
-          orderPunchUrl={CFG.orderPunchUrl}
-          orderPunchOrigin={orderPunchOrigin}
           dealers={scotDealers}
+          gasBase={CFG.gasBase}
+          orderPostUrl={CFG.orderPunchPostUrl}
           onOrderPunched={handleQuickOrderPunched}
+          onToast={showToast}
         />
       ) : null}
 

@@ -173,3 +173,30 @@ export async function postMarkNoCors(gasBase, body) {
   })
   return null
 }
+
+export async function postAddDealer(gasBase, { email, dealerName, color, idToken, signal, timeoutMs = 15_000 } = {}) {
+  if (!gasBase) throw new Error('Missing VITE_SCOT_GAS_BASE')
+  const payload = JSON.stringify({
+    path: 'addDealer',
+    email: String(email || '').trim(),
+    dealerName: String(dealerName || '').trim(),
+    color: String(color || '').trim(),
+    id_token: String(idToken || '').trim(),
+  })
+
+  const { signal: sig, cleanup } = abortable_(signal, timeoutMs)
+  try {
+    const res = await fetch(gasBase, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: payload,
+      signal: sig,
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const json = await res.json()
+    if (!json || !json.ok) throw new Error((json && json.error) || 'Add dealer failed')
+    return json
+  } finally {
+    cleanup()
+  }
+}

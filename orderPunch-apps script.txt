@@ -146,7 +146,7 @@ function doPost(e) {
     }
     var punchedByEmail = verified
       ? verified.email
-      : String(data.punchedByEmail || '').trim().toLowerCase();
+      : String(data.punchedByEmail).trim().toLowerCase();
     var punchedByName = verified
       ? verified.name
       : String(data.punchedByName || '').trim();
@@ -193,10 +193,8 @@ function doPost(e) {
     sheet.getRange(lastRow, ORDER_ID_COL).setValue(orderId);
 
     // Column BK = 63 (store punchedByEmail if available)
-    if (punchedByEmail) {
       const PUNCHED_BY_EMAIL_COL = 63; // BK
       sheet.getRange(lastRow, PUNCHED_BY_EMAIL_COL).setValue(punchedByEmail);
-    }
 
     return applyCors_(
       jsonOK({

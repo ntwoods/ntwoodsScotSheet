@@ -1,15 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ModalShell } from './ModalShell.jsx'
-
-function allowedIframeOrigins_(origin) {
-  const base = String(origin || '').trim()
-  const out = new Set()
-  if (base) out.add(base)
-  // Apps Script web apps often render from googleusercontent even when embedded via script.google.com URL.
-  if (base === 'https://script.google.com') out.add('https://script.googleusercontent.com')
-  if (base === 'https://script.googleusercontent.com') out.add('https://script.google.com')
-  return Array.from(out)
-}
+import { SalesOrderForm } from './SalesOrderForm.jsx'
 
 const OUTCOMES = [
   { value: 'OR', label: 'OR (Order Received)' },
@@ -25,117 +16,41 @@ export function FollowupModal({
   scEmail,
   scName,
   scIdToken,
-  orderPunchUrl,
-  orderPunchOrigin,
   dealers,
+  gasBase,
+  orderPostUrl,
   onClose,
   onSubmit,
   onRemarkChange,
+  onOrderSubmitted,
+  onToast,
 }) {
   const [outcome, setOutcome] = useState('')
   const [remark, setRemark] = useState('')
   const [sfWhen, setSfWhen] = useState('')
-  const iframeRef = useRef(null)
-  const iframeOrigins = useMemo(() => allowedIframeOrigins_(orderPunchOrigin), [orderPunchOrigin])
-  const [orderPunched, setOrderPunched] = useState(false)
 
   useEffect(() => {
     onRemarkChange?.('')
   }, [onRemarkChange])
 
-  const iframeSrc = useMemo(() => {
-    if (!context || outcome !== 'OR') return ''
-
-    const url = new URL(orderPunchUrl, window.location.href)
-    const params = url.searchParams
-
-    // Always force quick mode for consistent dealer UX inside SCOT.
-    params.set('variant', 'quick')
-
-    params.set('fromScot', '1')
-    params.set('scEmail', scEmail || '')
-    params.set('scName', scName || '')
-    params.set('scIdToken', scIdToken || '')
-    params.set('parentOrigin', window.location.origin)
-
-    // Attach context so the iframe can echo it back in ORDER_PUNCHED.meta.
-    params.set('rowIndex', String(context.rowIndex || ''))
-    params.set('callN', String(context.callN || ''))
-    params.set('plannedDate', String(context.callDate || ''))
-    params.set('clientName', String(context.clientName || ''))
-
-    return url.toString()
-  }, [context, outcome, orderPunchUrl, scEmail, scName, scIdToken])
-
-  const sendIframeInit = useCallback(() => {
-    if (outcome !== 'OR' || !context) return
-    try {
-      for (const targetOrigin of iframeOrigins) {
-        iframeRef.current?.contentWindow?.postMessage(
-          { type: 'DEALERS_INIT', dealers: dealers || [], email: scEmail },
-          targetOrigin,
-        )
-        iframeRef.current?.contentWindow?.postMessage(
-          { type: 'USER_CONTEXT', email: scEmail, name: scName, id_token: scIdToken },
-          targetOrigin,
-        )
-      }
-    } catch (err) {
-      // ignore
-      void err
-    }
-  }, [context, dealers, iframeOrigins, outcome, scEmail, scIdToken, scName])
-
-  useEffect(() => {
-    if (outcome !== 'OR' || !context) return
-
-    const onMessage = (ev) => {
-      if (!iframeOrigins.includes(ev.origin)) return
-      const msg = ev.data || {}
-      if (msg.type !== 'ORDER_PUNCHED' && msg.type !== 'SUCCESS') return
-
-      const payload = msg.payload || msg
-      const meta = payload.meta || {}
-      const metaRow = Number(meta.rowIndex || 0)
-      const metaCall = Number(meta.callN || 0)
-      const metaPlanned = String(meta.plannedDate || '').trim()
-
-      if (metaRow && metaRow !== Number(context.rowIndex)) return
-      if (metaCall && metaCall !== Number(context.callN)) return
-      if (metaPlanned && context.callDate && metaPlanned !== String(context.callDate)) return
-
-      // We do NOT auto-mark OR anymore. This only updates the UI indicator to guide the user.
-      setOrderPunched(true)
-    }
-
-    window.addEventListener('message', onMessage)
-    return () => window.removeEventListener('message', onMessage)
-  }, [outcome, context, iframeOrigins])
-
-  useEffect(() => {
-    // If dealers arrive after the iframe loads, re-send init.
-    if (outcome !== 'OR' || !context) return
-    sendIframeInit()
-  }, [outcome, context, sendIframeInit])
-
   if (!context) return null
 
   const info = `Call-${context.callN} | Scheduled: ${context.callDate}`
-
-  const actions = (
-    <>
-      <button className="btn btnLight" onClick={onClose}>
-        Cancel
-      </button>
-      <button
-        className="btn btnPrimary"
-        onClick={() => onSubmit({ outcome, remark, scheduleAt: sfWhen })}
-        disabled={!outcome || (outcome === 'SF' && !sfWhen)}
-      >
-        Submit
-      </button>
-    </>
-  )
+  const actions =
+    outcome && outcome !== 'OR' ? (
+      <>
+        <button className="btn btnLight" onClick={onClose}>
+          Cancel
+        </button>
+        <button
+          className="btn btnPrimary"
+          onClick={() => onSubmit({ outcome, remark, scheduleAt: sfWhen })}
+          disabled={!outcome || (outcome === 'SF' && !sfWhen)}
+        >
+          Submit
+        </button>
+      </>
+    ) : null
 
   return (
     <ModalShell title={`Follow-up for ${context.clientName}`} onClose={onClose} actions={actions}>
@@ -145,7 +60,6 @@ export function FollowupModal({
           value={outcome}
           onChange={(e) => {
             setOutcome(e.target.value)
-            setOrderPunched(false)
           }}
         >
           <option value="" disabled>
@@ -160,23 +74,33 @@ export function FollowupModal({
       </div>
 
       {outcome === 'OR' ? (
+        <>
           <div className="field">
-            <label>Order Punch</label>
-            <div className="hint">
-              Step 1: submit the order in the embedded form. Step 2: click <b>Submit</b> above to mark OR in Activity_Log.
-              {orderPunched ? <span style={{ marginLeft: 8, fontWeight: 800 }}>(Order submitted)</span> : null}
-            </div>
-            <div className="iframeHost" style={{ marginTop: 10 }}>
-              <iframe
-                ref={iframeRef}
-                title="Order Punch"
-                src={iframeSrc}
-                loading="lazy"
-                referrerPolicy="no-referrer"
-                onLoad={sendIframeInit}
-              />
-            </div>
+            <label>Remark (optional)</label>
+            <textarea
+              rows={3}
+              value={remark}
+              onChange={(e) => {
+                setRemark(e.target.value)
+                onRemarkChange?.(e.target.value)
+              }}
+              placeholder="Short remark..."
+            />
           </div>
+          <SalesOrderForm
+            mode="OR"
+            dealerFixedName={context.clientName}
+            signedInEmail={scEmail}
+            signedInName={scName}
+            signedInIdToken={scIdToken}
+            dealerOptions={dealers}
+            scotApiBase={gasBase}
+            orderPostUrl={orderPostUrl}
+            onCancel={onClose}
+            onToast={onToast}
+            onSuccess={(result) => onOrderSubmitted?.({ ...result, remark })}
+          />
+        </>
       ) : null}
 
       {outcome === 'SF' ? (
@@ -186,18 +110,20 @@ export function FollowupModal({
         </div>
       ) : null}
 
-      <div className="field">
-        <label>Remark (optional)</label>
-        <textarea
-          rows={4}
-          value={remark}
-          onChange={(e) => {
-            setRemark(e.target.value)
-            onRemarkChange?.(e.target.value)
-          }}
-          placeholder="Short remark…"
-        />
-      </div>
+      {outcome && outcome !== 'OR' ? (
+        <div className="field">
+          <label>Remark (optional)</label>
+          <textarea
+            rows={4}
+            value={remark}
+            onChange={(e) => {
+              setRemark(e.target.value)
+              onRemarkChange?.(e.target.value)
+            }}
+            placeholder="Short remark..."
+          />
+        </div>
+      ) : null}
 
       <div className="hint">{info}</div>
     </ModalShell>

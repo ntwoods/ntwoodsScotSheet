@@ -1,7 +1,8 @@
 /***************************************************
- * SC Follow-ups Backend (Apps Script)
- * - Handles SC follow-up due list + marking outcomes
- * - Quick Mode helpers: scotDealers, addDealer, rowByDealer
+ * SC Follow-ups Backend (Optimized)
+ * - Faster auth: tokeninfo cached
+ * - Faster GETs: Google Sheets Advanced Service (Values.get/batchGet)
+ * - Less repetition: memoized SpreadsheetApp objects + pure JS A1 helpers
  ***************************************************/
 
 const CFG = {
@@ -15,33 +16,131 @@ const CFG = {
   FIRST_DAY_COL: 15,   // O
   LAST_DAY_COL: 45,    // AS
   TIMEZONE: 'Asia/Kolkata',
+  // Perf logging is opt-in via:
+  // - GET:  ?perf=1  (or ScriptProperty PERF_LOG=1)
+  // - POST: { perf: 1 } (or ScriptProperty PERF_LOG=1)
+  PERF_LOG_PROP: 'PERF_LOG',
+  PERF_LOG_SHEET_PROP: 'PERF_LOG_SHEET', // optional sheet name to append perf rows
   ALLOWED_AUDIENCES: [
     '360849757137-agopfs0m8rgmcj541ucpg22btep5olt3.apps.googleusercontent.com'
   ],
   DRIVE_FOLDER_NAME: 'SC_Orders'
 };
 
-/* ========== Utilities ========== */
+// ---- In-execution memo (no data caching) ----
+const MEMO = {
+  ss: null,
+  sh: null,
+  logSh: null,
+  ocSs: null,
+  ocSh: null,
+};
 
-function ss_() {
-  return SpreadsheetApp.openById(CFG.SHEET_ID);
-}
-function sheet_() {
-  return ss_().getSheetByName(CFG.SHEET_NAME);
-}
-function logSheet_() {
-  const ss = ss_();
-  let sh = ss.getSheetByName(CFG.ACTIVITY_LOG_SHEET);
-  if (!sh) {
-    sh = ss.insertSheet(CFG.ACTIVITY_LOG_SHEET);
-    sh.appendRow([
-      'TS (IST)', 'SC Email', 'Client', 'RowIndex',
-      'Day(1-31)', 'MarkedA1', 'Outcome', 'Remark',
-      'ResolvedCall', 'OriginalCallDate',
-      'FollowUpPlanned', 'FollowUpActual', 'ActionFileURL', 'UserAgent'
-    ]);
+// ---- Perf context (per-execution) ----
+const PERF_CTX = {
+  enabled: false,
+  attachToResponse: false,
+  rid: '',
+  route: '',
+  t0: 0,
+  parts: [],
+};
+
+function perfEnabledFrom_(eOrBody) {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const propOn = String(props.getProperty(CFG.PERF_LOG_PROP) || '').trim() === '1';
+    if (propOn) return true;
+  } catch (e) {
+    void e;
   }
-  return sh;
+
+  try {
+    // e.parameter.perf=1, or body.perf=1
+    const p = (eOrBody && eOrBody.parameter) || {};
+    const v = (p && (p.perf || p.debug)) || (eOrBody && eOrBody.perf);
+    return String(v || '').trim() === '1' || String(v || '').trim().toLowerCase() === 'true';
+  } catch (e) {
+    return false;
+  }
+}
+
+function perfInit_(enabled, route, attachToResponse) {
+  PERF_CTX.enabled = !!enabled;
+  PERF_CTX.attachToResponse = !!attachToResponse;
+  PERF_CTX.rid = Utilities.getUuid().slice(0, 8);
+  PERF_CTX.route = String(route || '');
+  PERF_CTX.t0 = Date.now();
+  PERF_CTX.parts = [];
+}
+
+function perfAdd_(label, ms, extra) {
+  if (!PERF_CTX.enabled) return;
+  PERF_CTX.parts.push({
+    label: String(label || ''),
+    ms: Number(ms || 0),
+    extra: extra || null,
+  });
+}
+
+function perfWrap_(label, fn, extra) {
+  const t = Date.now();
+  try {
+    return fn();
+  } finally {
+    perfAdd_(label, Date.now() - t, extra);
+  }
+}
+
+function perfSummary_() {
+  const total = Date.now() - PERF_CTX.t0;
+  const parts = PERF_CTX.parts.slice();
+  const byLabel = {};
+  for (const p of parts) {
+    const k = p.label || '(unknown)';
+    byLabel[k] = (byLabel[k] || 0) + (Number(p.ms) || 0);
+  }
+  return {
+    rid: PERF_CTX.rid,
+    route: PERF_CTX.route,
+    totalMs: total,
+    parts,
+    byLabel,
+  };
+}
+
+function perfFlush_(statusCode) {
+  if (!PERF_CTX.enabled) return;
+  const sum = perfSummary_();
+  // Avoid logging secrets: no tokens, no sheet IDs.
+  console.log('[PERF]', JSON.stringify({ ...sum, statusCode: Number(statusCode || 0) }));
+
+  // Optional append to a sheet for historical analysis
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const shName = String(props.getProperty(CFG.PERF_LOG_SHEET_PROP) || '').trim();
+    if (!shName) return;
+
+    const row = [
+      Utilities.formatDate(new Date(), CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
+      sum.rid,
+      sum.route,
+      sum.totalMs,
+      Number(statusCode || 0),
+      JSON.stringify(sum.byLabel).slice(0, 45000),
+    ];
+    valuesAppend_(CFG.SHEET_ID, `${shName}!A:F`, row);
+  } catch (e) {
+    // best-effort only
+    void e;
+  }
+}
+
+// ========== Fast helpers ==========
+
+function sheetsSvcEnabled_() {
+  try { return !!Sheets && !!Sheets.Spreadsheets && !!Sheets.Spreadsheets.Values; }
+  catch (e) { return false; }
 }
 
 function J_(o) {
@@ -49,54 +148,281 @@ function J_(o) {
     .createTextOutput(JSON.stringify(o))
     .setMimeType(ContentService.MimeType.JSON);
 }
-function ok_(p) {
-  return J_({ ok: true, ...p });
-}
-function bad_(m, c) {
-  return J_({ ok: false, error: String(m), code: c || 400 });
-}
+function ok_(p) { return J_({ ok: true, ...p }); }
+function bad_(m, c) { return J_({ ok: false, error: String(m), code: c || 400 }); }
+
+function normEmail_(s) { return String(s || '').trim().toLowerCase(); }
 
 function todayIST_() {
+  // Keep behavior close to your existing logic
   const s = Utilities.formatDate(new Date(), CFG.TIMEZONE, 'yyyy-MM-dd');
-  return new Date(s + 'T00:00:00');
+  return parseISODate_(s);
 }
-function toISO_(d) {
-  return Utilities.formatDate(d, CFG.TIMEZONE, 'yyyy-MM-dd');
-}
-function toISOdt_(d) {
-  return Utilities.formatDate(d, CFG.TIMEZONE, "yyyy-MM-dd'T'HH:mm:ss");
-}
+function toISO_(d) { return Utilities.formatDate(d, CFG.TIMEZONE, 'yyyy-MM-dd'); }
+function toISOdt_(d) { return Utilities.formatDate(d, CFG.TIMEZONE, "yyyy-MM-dd'T'HH:mm:ss"); }
+
 function parseISODate_(s) {
-  const [y, m, d] = s.split('-').map(Number);
-  return new Date(y, m - 1, d);
+  const [y, m, d] = String(s).split('-').map(Number);
+  return new Date(y, m - 1, d, 0, 0, 0, 0);
 }
 function dateOnly_(d) {
   const x = new Date(d);
   x.setHours(0, 0, 0, 0);
   return x;
 }
-function normEmail_(s) {
-  return String(s || '').trim().toLowerCase();
+
+function hasTime_(d) {
+  return (d instanceof Date && !isNaN(d) && (d.getHours() + d.getMinutes() + d.getSeconds()) !== 0);
+}
+
+// Google Sheets date serial -> JS Date (UTC-based). Formatting in IST stays correct.
+function serialToDate_(n) {
+  if (typeof n !== 'number' || isNaN(n)) return null;
+  const ms = Math.round((n - 25569) * 86400 * 1000);
+  return new Date(ms);
+}
+
+function asDate_(v) {
+  if (v instanceof Date) return v;
+  if (typeof v === 'number') return serialToDate_(v);
+  return null;
+}
+
+// Column number -> A1 letter (pure JS; no sheet calls)
+function colToLetter_(col) {
+  let n = Number(col);
+  let s = '';
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+function colA1_(col) { return colToLetter_(col); }
+
+function dayToCol_(day) { return CFG.FIRST_DAY_COL + (day - 1); }
+
+function monthEndDate_(d) { return new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999); }
+function weekEndFor_(d) {
+  const dd = d.getDate();
+  if (dd <= 7)  return new Date(d.getFullYear(), d.getMonth(), 7,  23, 59, 59, 999);
+  if (dd <= 14) return new Date(d.getFullYear(), d.getMonth(), 14, 23, 59, 59, 999);
+  if (dd <= 21) return new Date(d.getFullYear(), d.getMonth(), 21, 23, 59, 59, 999);
+  return monthEndDate_(d);
+}
+function inRangeInclusive_(dateObj, start, end) {
+  const x = dateOnly_(dateObj).getTime();
+  return x >= dateOnly_(start).getTime() && x <= dateOnly_(end).getTime();
+}
+
+// ======== SpreadsheetApp memo (only when needed) ========
+
+function ss_() {
+  if (!MEMO.ss) {
+    MEMO.ss = perfWrap_('SpreadsheetApp.openById(main)', () => SpreadsheetApp.openById(CFG.SHEET_ID));
+  }
+  return MEMO.ss;
+}
+function sheet_() {
+  if (!MEMO.sh) {
+    MEMO.sh = perfWrap_('SpreadsheetApp.getSheetByName(main)', () => ss_().getSheetByName(CFG.SHEET_NAME));
+  }
+  return MEMO.sh;
+}
+function logSheet_() {
+  if (MEMO.logSh) return MEMO.logSh;
+
+  const ss = ss_();
+  let sh = perfWrap_('SpreadsheetApp.getSheetByName(log)', () => ss.getSheetByName(CFG.ACTIVITY_LOG_SHEET));
+  if (!sh) {
+    sh = perfWrap_('SpreadsheetApp.insertSheet(log)', () => ss.insertSheet(CFG.ACTIVITY_LOG_SHEET));
+    perfWrap_('SpreadsheetApp.appendRow(logHeader)', () => sh.appendRow([
+      'TS (IST)', 'SC Email', 'Client', 'RowIndex',
+      'Day(1-31)', 'MarkedA1', 'Outcome', 'Remark',
+      'ResolvedCall', 'OriginalCallDate',
+      'FollowUpPlanned', 'FollowUpActual', 'ActionFileURL', 'UserAgent'
+    ]));
+  }
+  MEMO.logSh = sh;
+  return sh;
+}
+
+// ======== OrderCycle SpreadsheetApp memo (rare use; mainly for lastRow) ========
+
+function ocSs_() {
+  if (!MEMO.ocSs) {
+    MEMO.ocSs = perfWrap_('SpreadsheetApp.openById(orderCycle)', () => SpreadsheetApp.openById(CFG.ORDER_CYCLE_SHEET_ID));
+  }
+  return MEMO.ocSs;
+}
+function ocSheet_() {
+  if (!MEMO.ocSh) {
+    MEMO.ocSh = perfWrap_('SpreadsheetApp.getSheetByName(orderCycle)', () => ocSs_().getSheetByName(CFG.ORDER_CYCLE_SHEET_NAME));
+  }
+  return MEMO.ocSh;
+}
+
+function getOrderCycleLastRow_() {
+  const props = PropertiesService.getScriptProperties();
+  const kRow = 'ORDER_CYCLE_LAST_ROW';
+  const kAt = 'ORDER_CYCLE_LAST_ROW_AT';
+
+  const cachedRow = Number(props.getProperty(kRow) || 0);
+  const cachedAt = Number(props.getProperty(kAt) || 0);
+  const now = Date.now();
+
+  if (cachedRow > 0 && cachedAt > 0 && (now - cachedAt) < 5 * 60 * 1000) return cachedRow;
+
+  const lastRow = perfWrap_('OrderCycle.getLastRow', () => ocSheet_().getLastRow());
+  props.setProperty(kRow, String(lastRow || 0));
+  props.setProperty(kAt, String(now));
+  return Number(lastRow || 0);
+}
+
+// ======== Sheets API wrappers (fast GET) ========
+
+function valuesGet_(spreadsheetId, rangeA1, opts) {
+  const t0 = Date.now();
+  const opt = opts || {};
+  if (sheetsSvcEnabled_()) {
+    const res = Sheets.Spreadsheets.Values.get(spreadsheetId, rangeA1, {
+      majorDimension: opt.majorDimension || 'ROWS',
+      valueRenderOption: opt.valueRenderOption || 'UNFORMATTED_VALUE',
+      dateTimeRenderOption: opt.dateTimeRenderOption || 'SERIAL_NUMBER',
+    });
+    perfAdd_('Sheets.Values.get', Date.now() - t0, { rangeA1: String(rangeA1 || '').slice(0, 140) });
+    return res.values || [];
+  }
+
+  // Fallback (slower)
+  const [sheetName, a1] = String(rangeA1).split('!');
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const sh = ss.getSheetByName(sheetName);
+  const out = sh.getRange(a1).getValues();
+  perfAdd_('SpreadsheetApp.getValues(fallback)', Date.now() - t0, { rangeA1: String(rangeA1 || '').slice(0, 140) });
+  return out;
+}
+
+function valuesBatchGet_(spreadsheetId, ranges, opts) {
+  const t0 = Date.now();
+  const opt = opts || {};
+  if (sheetsSvcEnabled_()) {
+    const res = Sheets.Spreadsheets.Values.batchGet(spreadsheetId, {
+      ranges: ranges,
+      majorDimension: opt.majorDimension || 'ROWS',
+      valueRenderOption: opt.valueRenderOption || 'UNFORMATTED_VALUE',
+      dateTimeRenderOption: opt.dateTimeRenderOption || 'SERIAL_NUMBER',
+    });
+    const out = [];
+    const vrs = res.valueRanges || [];
+    for (let i = 0; i < vrs.length; i++) out.push(vrs[i].values || []);
+    perfAdd_('Sheets.Values.batchGet', Date.now() - t0, { ranges: (ranges || []).length || 0 });
+    return out;
+  }
+
+  // Fallback
+  const out = ranges.map(r => valuesGet_(spreadsheetId, r, { valueRenderOption: 'UNFORMATTED_VALUE', dateTimeRenderOption: 'SERIAL_NUMBER' }));
+  perfAdd_('SpreadsheetApp.getValues.batch(fallback)', Date.now() - t0, { ranges: (ranges || []).length || 0 });
+  return out;
+}
+
+function valuesAppend_(spreadsheetId, rangeA1, row) {
+  if (sheetsSvcEnabled_()) {
+    Sheets.Spreadsheets.Values.append(
+      { values: [row] },
+      spreadsheetId,
+      rangeA1,
+      { valueInputOption: 'USER_ENTERED', insertDataOption: 'INSERT_ROWS' }
+    );
+    return;
+  }
+  // Fallback
+  logSheet_().appendRow(row);
+}
+
+// ========== Cache helpers (safe, short TTL) ==========
+
+function cacheGetJson_(key) {
+  const cache = CacheService.getScriptCache();
+  const raw = cache.get(String(key || ''));
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+function cachePutJson_(key, obj, ttlSec) {
+  const cache = CacheService.getScriptCache();
+  const ttl = Math.max(1, Math.min(21600, Number(ttlSec || 0) || 0));
+  cache.put(String(key || ''), JSON.stringify(obj), ttl);
+}
+
+// ========== Range/run helpers ==========
+
+function buildRuns_(rowIndexes) {
+  const rows = (rowIndexes || []).slice().filter(n => Number(n) > 0).sort((a, b) => a - b);
+  if (!rows.length) return [];
+
+  const runs = [];
+  let start = rows[0];
+  let prev = rows[0];
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (r === prev + 1) {
+      prev = r;
+      continue;
+    }
+    runs.push([start, prev]);
+    start = r;
+    prev = r;
+  }
+  runs.push([start, prev]);
+  return runs;
+}
+
+// ========== Auth (cached) ==========
+
+function hashToken_(s) {
+  const bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(s), Utilities.Charset.UTF_8);
+  return bytes.map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
 }
 
 function verify_(idToken) {
   if (!idToken) throw new Error('Missing id_token');
-  const r = UrlFetchApp.fetch(
-    'https://oauth2.googleapis.com/tokeninfo?id_token=' +
-    encodeURIComponent(idToken),
+
+  // Cache: reduces tokeninfo calls drastically
+  const cache = CacheService.getScriptCache();
+  const key = 'idt_' + hashToken_(idToken);
+  const cached = cache.get(key);
+  if (cached) return JSON.parse(cached);
+
+  const r = perfWrap_('UrlFetch.tokeninfo', () => UrlFetchApp.fetch(
+    'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken),
     { muteHttpExceptions: true }
-  );
+  ));
   if (r.getResponseCode() !== 200) throw new Error('Invalid ID token');
+
   const info = JSON.parse(r.getContentText());
-  if (!CFG.ALLOWED_AUDIENCES.includes(info.aud)) {
-    throw new Error('Audience mismatch');
-  }
+
+  if (!CFG.ALLOWED_AUDIENCES.includes(info.aud)) throw new Error('Audience mismatch');
   if (!info.email_verified) throw new Error('Email not verified');
-  return {
+
+  const user = {
     email: (info.email || '').toLowerCase(),
     name: info.name || '',
     picture: info.picture || ''
   };
+
+  // TTL = token expiry - now (bounded)
+  let ttl = 300; // default 5 min
+  const exp = Number(info.exp || 0);
+  if (exp) {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const remain = exp - nowSec - 30;
+    ttl = Math.max(60, Math.min(21600, remain));
+  }
+  cache.put(key, JSON.stringify(user), ttl);
+  return user;
 }
 
 // Mapping rules for OrderCycle punchedByEmail -> which SC user sees the order.
@@ -109,73 +435,39 @@ function orderOwnerForPunchedBy_(punchedByEmail) {
   return '';
 }
 
-function dayToCol_(day) {
-  return CFG.FIRST_DAY_COL + (day - 1);
-}
-function colA1_(col) {
-  return sheet_()
-    .getRange(1, col)
-    .getA1Notation()
-    .replace(/[0-9]/g, '');
-}
-function hasTime_(d) {
-  return (
-    d instanceof Date &&
-    !isNaN(d) &&
-    (d.getHours() + d.getMinutes() + d.getSeconds()) !== 0
-  );
+// ========== Day remark helpers (optimized slices) ==========
+
+function lastRemarkFromDaySlice_(daySlice, todayDay) {
+  if (todayDay <= 1) return { text: '', day: 0 };
+  const upto = Math.min(todayDay - 1, 31);
+  for (let i = upto - 1; i >= 0; i--) {
+    const v = String(daySlice[i] || '').trim();
+    if (v) return { text: v, day: i + 1 };
+  }
+  return { text: '', day: 0 };
 }
 
-function monthEndDate_(d) {
-  return new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59, 999);
-}
-
-// Week buckets: 1–7, 8–14, 15–21, 22–monthEnd
-function weekEndFor_(d) {
-  const dd = d.getDate();
-  if (dd <= 7) return new Date(d.getFullYear(), d.getMonth(), 7, 23, 59, 59, 999);
-  if (dd <= 14) return new Date(d.getFullYear(), d.getMonth(), 14, 23, 59, 59, 999);
-  if (dd <= 21) return new Date(d.getFullYear(), d.getMonth(), 21, 23, 59, 59, 999);
-  return monthEndDate_(d);
-}
-
-function inRangeInclusive_(dateObj, start, end) {
-  const x = dateOnly_(dateObj).getTime();
-  return (
-    x >= dateOnly_(start).getTime() &&
-    x <= dateOnly_(end).getTime()
-  );
-}
-
-// Planned-date ko uski week-window ke andar settle maana jaye
-// (1–7 => 7, 8–14 => 14, 15–21 => 21, 22–EOM), par sirf aaj tak.
-function settledInWindow_(rowVals, plannedDateObj, todayObj) {
+function settledInWindowDaySlice_(daySlice, plannedDateObj, todayObj) {
   if (!(plannedDateObj instanceof Date)) return false;
 
-  // window [plannedDate .. min(bucketEnd(plannedDate), today)]
   const start = dateOnly_(plannedDateObj);
   const windowEnd = weekEndFor_(plannedDateObj);
-  const end = dateOnly_(
-    new Date(
-      Math.min(windowEnd.getTime(), dateOnly_(todayObj).getTime())
-    )
-  );
+  const end = dateOnly_(new Date(Math.min(windowEnd.getTime(), dateOnly_(todayObj).getTime())));
 
-  // Day columns O:AS => 1..31 map to FIRST_DAY_COL..LAST_DAY_COL
   const startDay = Number(Utilities.formatDate(start, CFG.TIMEZONE, 'd')); // 1..31
   const endDay = Number(Utilities.formatDate(end, CFG.TIMEZONE, 'd'));     // 1..31
-  const startIdx = dayToCol_(startDay) - 1; // zero-based for rowVals
-  const endIdx = dayToCol_(endDay) - 1;
 
-  for (let c = startIdx; c <= endIdx; c++) {
-    const val = String(rowVals[c] || '').trim();
-    if (val) {
-      // Day cell me SF hum kabhi nahi likhte; OR/NR/AI/MD hi aate hain.
-      return true; // settled
-    }
+  const sIdx = Math.max(0, startDay - 1);
+  const eIdx = Math.min(30, endDay - 1);
+
+  for (let i = sIdx; i <= eIdx; i++) {
+    const val = String(daySlice[i] || '').trim();
+    if (val) return true;
   }
-  return false; // abhi tak is window me outcome nahi aaya
+  return false;
 }
+
+// ========== Existing follow-up edit helpers (kept same behavior) ==========
 
 function clearFollowupsInRange_(rowIndex, startDate, endDate) {
   const sh = sheet_();
@@ -201,7 +493,6 @@ function insertFollowupAt_(rowIndex, dateObj) {
   const range = sh.getRange(rowIndex, 7, 1, 4); // G:J
   const vals = range.getValues()[0];
 
-  // First empty slot
   for (let i = 0; i < 4; i++) {
     if (!(vals[i] instanceof Date) && String(vals[i] || '').trim() === '') {
       vals[i] = dateOnly_(dateObj);
@@ -209,216 +500,562 @@ function insertFollowupAt_(rowIndex, dateObj) {
       return true;
     }
   }
-  // Fallback to J
   vals[3] = dateOnly_(dateObj);
   range.setValues([vals]);
   return true;
 }
 
-/* ========== GET Router ========== */
+// ========== GET Router ==========
 
 function doGet(e) {
   const path = (e && e.parameter && e.parameter.path || '').trim();
+  const perfOn = perfEnabledFrom_(e);
+  // Attach perf only when explicitly requested
+  const attach = String(e && e.parameter && e.parameter.perf || '').trim() === '1';
+  perfInit_(perfOn, `GET:${path || 'me'}`, attach);
+
   const idt = (e && e.parameter && e.parameter.id_token) || '';
 
-  // Auth'd whoami
-  if (!path || path === 'me') {
-    try {
-      return ok_({ user: verify_(idt) });
-    } catch (err) {
-      return bad_(err, 401);
+  let statusCode = 200;
+  try {
+    // Auth'd whoami
+    if (!path || path === 'me') {
+      try {
+        const user = perfWrap_('auth.verify', () => verify_(idt));
+        const out = { user };
+        if (PERF_CTX.attachToResponse) out.__perf = perfSummary_();
+        return ok_(out);
+      } catch (err) {
+        statusCode = 401;
+        return bad_(err, 401);
+      }
     }
-  }
 
-  // === SF REMARKS FETCHER ===
+  // === SF REMARKS FETCHER === (optimized: read only needed columns)
   if (path === 'sfRemarks') {
     try {
+      const tAuth = Date.now();
       const client = String(e.parameter.client || '').trim();
-      if (!client) return bad_('client required', 400);
+      if (!client) {
+        statusCode = 400;
+        return bad_('client required', 400);
+      }
+      perfAdd_('sfRemarks.validate', Date.now() - tAuth);
 
-      const log = logSheet_().getDataRange().getValues();
+      // Ensure log sheet exists
+      perfWrap_('sfRemarks.ensureLogSheet', () => logSheet_());
+
+      // Read only A, C, G, H (TS, Client, Outcome, Remark)
+      const ranges = [
+        `${CFG.ACTIVITY_LOG_SHEET}!A2:A`,
+        `${CFG.ACTIVITY_LOG_SHEET}!C2:C`,
+        `${CFG.ACTIVITY_LOG_SHEET}!G2:G`,
+        `${CFG.ACTIVITY_LOG_SHEET}!H2:H`,
+      ];
+      const [tsCol, clientCol, outcomeCol, remarkCol] =
+        perfWrap_('sfRemarks.read', () => valuesBatchGet_(CFG.SHEET_ID, ranges, { valueRenderOption: 'UNFORMATTED_VALUE' }), { ranges: ranges.length });
+
+      const n = Math.max(tsCol.length, clientCol.length, outcomeCol.length, remarkCol.length);
       const out = [];
 
-      for (let r = 1; r < log.length; r++) {
-        const row = log[r];
-        const outcome = row[6];
-        if (outcome === 'SF' && row[2] === client) {
+      const tTransform = Date.now();
+      for (let i = 0; i < n; i++) {
+        const oc = String((outcomeCol[i] && outcomeCol[i][0]) || '').trim();
+        const cl = String((clientCol[i] && clientCol[i][0]) || '').trim();
+        if (oc === 'SF' && cl === client) {
+          const tsV = tsCol[i] ? tsCol[i][0] : '';
+          const tsD = asDate_(tsV);
           out.push({
-            ts: row[0],
-            remark: row[7] || ''
+            ts: tsD ? Utilities.formatDate(tsD, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss') : String(tsV || ''),
+            remark: String((remarkCol[i] && remarkCol[i][0]) || '')
           });
         }
       }
+      perfAdd_('sfRemarks.transform', Date.now() - tTransform, { matched: out.length });
 
-      return ok_({ remarks: out });
+      const resp = { remarks: out };
+      if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
+      return ok_(resp);
     } catch (err) {
+      statusCode = 500;
       return bad_(err, 500);
     }
   }
 
-  // OrderCycle summary (Orders Received / In Process)
+  // OrderCycle summary (optimized: fetch only needed columns)
   if (path === 'orderCycleSummary') {
     try {
-      const user = verify_(idt);
+      const nocache = String((e && e.parameter && (e.parameter.nocache || e.parameter.fresh)) || '').trim() === '1';
+      const fast = String((e && e.parameter && e.parameter.fast) || '').trim() === '1';
+      const windowRowsRaw = Number((e && e.parameter && e.parameter.windowRows) || 0) || 0;
+      const windowRows = Math.max(200, Math.min(20000, windowRowsRaw || 2000));
 
-      const ss = SpreadsheetApp.openById(CFG.ORDER_CYCLE_SHEET_ID);
-      const sh = ss.getSheetByName(CFG.ORDER_CYCLE_SHEET_NAME);
-      if (!sh) return bad_('OrderCycle sheet not found', 500);
+      let user;
+      try { user = perfWrap_('auth.verify', () => verify_(idt)); }
+      catch (err) {
+        statusCode = 401;
+        return bad_(err, 401);
+      }
 
-      const lastRow = sh.getLastRow();
-      if (lastRow < 2) return ok_({ received: [], inProcess: [] });
+      const cacheKey = `ocs_v3:${user.email}:${fast ? `fast:${windowRows}` : 'full'}`;
+      if (!nocache) {
+        const cached = cacheGetJson_(cacheKey);
+        if (cached && Array.isArray(cached.received) && Array.isArray(cached.inProcess)) {
+          perfAdd_('orderCycle.cacheHit', 0, { received: cached.received.length, inProcess: cached.inProcess.length });
+          const resp = { received: cached.received, inProcess: cached.inProcess };
+          if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
+          return ok_(resp);
+        }
+      }
 
-      // Read A..BK (1..63) so we have A,B,D,E,F,Y,BD,BK in one hit.
-      const rng = sh.getRange(2, 1, lastRow - 1, 63);
-      const V = rng.getValues();
+      // Determine scan window (fast mode reads only last N rows)
+      let startRow = 2;
+      let endRow = 0;
+      if (fast) {
+        endRow = getOrderCycleLastRow_();
+        if (!endRow || endRow < 2) {
+          const resp = { received: [], inProcess: [] };
+          if (!nocache) cachePutJson_(cacheKey, resp, 10);
+          if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
+          return ok_(resp);
+        }
+        startRow = Math.max(2, endRow - windowRows + 1);
+      }
+
+      // Phase-1: read only filter/meta columns
+      const fRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!F${startRow}:${fast ? `F${endRow}` : 'F'}`;   // statusF
+      const yRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!Y${startRow}:${fast ? `Y${endRow}` : 'Y'}`;   // colY
+      const bkRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!BK${startRow}:${fast ? `BK${endRow}` : 'BK'}`; // punchedByEmail
+
+      const [statusCol, yCol, bkCol] = perfWrap_(
+        'orderCycle.readMeta',
+        () => valuesBatchGet_(CFG.ORDER_CYCLE_SHEET_ID, [fRange, yRange, bkRange], { valueRenderOption: 'UNFORMATTED_VALUE' }),
+        { ranges: 3, startRow, endRow: endRow || null }
+      );
+
+      const n = Math.max(statusCol.length, yCol.length, bkCol.length);
+      const metaByRow = Object.create(null);
+      const matchRows = [];
+
+      const tMatch = Date.now();
+      for (let i = 0; i < n; i++) {
+        const punchedByEmail = normEmail_((bkCol[i] && bkCol[i][0]) || '');
+        const owner = orderOwnerForPunchedBy_(punchedByEmail);
+        if (!owner || owner !== user.email) continue;
+
+        const statusF = String((statusCol[i] && statusCol[i][0]) || '').trim();
+        const colY = String((yCol[i] && yCol[i][0]) || '').trim();
+
+        const isReceived = statusF === 'Pending';
+        const isInProcess = statusF !== '-' && !colY;
+        if (!isReceived && !isInProcess) continue;
+
+        const rowIndex = startRow + i;
+        matchRows.push(rowIndex);
+        metaByRow[rowIndex] = {
+          statusF,
+          punchedByEmail,
+          bucket: isReceived ? 'received' : 'inProcess',
+        };
+      }
+      perfAdd_('orderCycle.match', Date.now() - tMatch, { matched: matchRows.length });
+
+      if (!matchRows.length) {
+        const resp = { received: [], inProcess: [] };
+        if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
+        if (!nocache) cachePutJson_(cacheKey, resp, 15);
+        return ok_(resp);
+      }
+
+      // Phase-2: read only the matching rows' details (B..E)
+      const runs = buildRuns_(matchRows);
+      perfAdd_('orderCycle.runs', 0, { runs: runs.length });
 
       const received = [];
       const inProcess = [];
 
-      for (let r = 0; r < V.length; r++) {
-        const row = V[r];
-        const ts = row[0];            // A
-        const dealerName = row[1];    // B
-        const location = row[3];      // D
-        const orderUrl = row[4];      // E
-        const statusF = String(row[5] || '').trim(); // F
-        const colY = String(row[24] || '').trim();   // Y
-        const orderId = String(row[55] || '').trim(); // BD
-        const punchedByEmail = normEmail_(row[62]);  // BK
-
-        const owner = orderOwnerForPunchedBy_(punchedByEmail);
-        if (!owner || owner !== user.email) continue;
-
-        const item = {
-          tsISO: (ts instanceof Date) ? toISOdt_(ts) : String(ts || ''),
-          dealerName: String(dealerName || '').trim(),
-          location: String(location || '').trim(),
-          orderUrl: String(orderUrl || '').trim(),
-          statusF,
-          orderId,
-          punchedByEmail
-        };
-
-        if (statusF === 'Pending') {
-          received.push(item);
-        } else if (statusF !== '-' && !colY) {
-          inProcess.push(item);
+      const maxRunsPerBatch = 25; // 3 ranges/run => <= 75 ranges per batchGet
+      for (let b = 0; b < runs.length; b += maxRunsPerBatch) {
+        const chunkRuns = runs.slice(b, b + maxRunsPerBatch);
+        const ranges = [];
+        for (const [s, e2] of chunkRuns) {
+          ranges.push(`${CFG.ORDER_CYCLE_SHEET_NAME}!B${s}:E${e2}`);   // dealer + location + url
+          ranges.push(`${CFG.ORDER_CYCLE_SHEET_NAME}!A${s}:A${e2}`);   // ts
+          ranges.push(`${CFG.ORDER_CYCLE_SHEET_NAME}!BD${s}:BD${e2}`); // orderId
         }
+
+        const got = perfWrap_(
+          'orderCycle.readDetails.batch',
+          () => valuesBatchGet_(CFG.ORDER_CYCLE_SHEET_ID, ranges, { valueRenderOption: 'UNFORMATTED_VALUE' }),
+          { ranges: ranges.length }
+        );
+
+        const tTransform = Date.now();
+        for (let i = 0; i < chunkRuns.length; i++) {
+          const [s, e2] = chunkRuns[i];
+          const rows = got[i * 3 + 0] || [];
+          const tsRows = got[i * 3 + 1] || [];
+          const idRows = got[i * 3 + 2] || [];
+          const len = Math.max(0, e2 - s + 1);
+
+          for (let off = 0; off < len; off++) {
+            const rowIndex = s + off;
+            const meta = metaByRow[rowIndex];
+            if (!meta) continue;
+
+            const r = rows[off] || [];
+            // B..E => [dealer, C, location, orderUrl]
+            const dealerName = String(r[0] || '').trim();
+            const location = String(r[2] || '').trim();
+            const orderUrl = String(r[3] || '').trim();
+
+            const tsV = tsRows[off] ? tsRows[off][0] : '';
+            const tsD = asDate_(tsV);
+            const orderId = String((idRows[off] && idRows[off][0]) || '').trim();
+            const item = {
+              tsISO: tsD ? toISOdt_(tsD) : String(tsV || ''),
+              dealerName,
+              location,
+              orderUrl,
+              statusF: meta.statusF,
+              orderId,
+              punchedByEmail: meta.punchedByEmail,
+            };
+
+            if (meta.bucket === 'received') received.push(item);
+            else inProcess.push(item);
+          }
+        }
+        perfAdd_('orderCycle.transform.batch', Date.now() - tTransform, { runs: chunkRuns.length });
       }
 
-      return ok_({ received, inProcess });
+      const resp = { received, inProcess };
+      if (!nocache) cachePutJson_(cacheKey, resp, fast ? 10 : 15);
+      if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
+      return ok_(resp);
     } catch (err) {
+      statusCode = 500;
       return bad_(err, 500);
     }
   }
-  
-  // Dealers by email (Quick mode dropdown)
+
+  // Dealers by email (Quick mode dropdown) - optimized: read only A:B
   if (path === 'scotDealers') {
     try {
-      const email = String(e && e.parameter && e.parameter.email || '').trim();
-      if (!email) return bad_('email required', 400);
+      const email = String(e && e.parameter && e.parameter.email || '').trim().toLowerCase();
+      if (!email) {
+        statusCode = 400;
+        return bad_('email required', 400);
+      }
 
-      const sh = sheet_();
-      const V = sh.getDataRange().getValues(); // A=email, B=Dealer, D=Color
+      const rows = perfWrap_('scotDealers.read', () => valuesGet_(CFG.SHEET_ID, `${CFG.SHEET_NAME}!A${CFG.DATA_START_ROW}:B`, {}));
+
       const dealers = [];
-      for (let r = CFG.DATA_START_ROW - 1; r < V.length; r++) {
-        const em = String(V[r][0] || '').trim().toLowerCase();
-        if (em === email.toLowerCase()) {
-          const d = V[r][1];
+      const n = rows.length;
+      for (let i = 0; i < n; i++) {
+        const em = String((rows[i] && rows[i][0]) || '').trim().toLowerCase();
+        if (em === email) {
+          const d = (rows[i] && rows[i][1]) || '';
           if (d) dealers.push(d);
         }
       }
       const uniq = Array.from(new Set(dealers));
-      return ok_({ dealers: uniq });
+      const resp = { dealers: uniq };
+      if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
+      return ok_(resp);
     } catch (err) {
+      statusCode = 500;
       return bad_(err, 500);
     }
   }
 
-  // Row lookup by (email, dealer)
+  // Row lookup by (email, dealer) - optimized: scan A:B only; then read G:J if needed
   if (path === 'rowByDealer') {
     try {
-      const email = String(e && e.parameter && e.parameter.email || '').trim();
-      const dealer = String(e && e.parameter && e.parameter.dealer || '').trim();
+      const email = String(e && e.parameter && e.parameter.email || '').trim().toLowerCase();
+      const dealer = String(e && e.parameter && e.parameter.dealer || '').trim().toLowerCase();
       const includeCalls = String(e && e.parameter && e.parameter.includeCalls || '').trim() === '1';
-      if (!email || !dealer) return bad_('email & dealer required', 400);
+      if (!email || !dealer) {
+        statusCode = 400;
+        return bad_('email & dealer required', 400);
+      }
 
-      const sh = sheet_();
-      const V = sh.getDataRange().getValues(); // A=email, B=Dealer
-      let found = 0;
-      for (let r = CFG.DATA_START_ROW - 1; r < V.length; r++) {
-        const em = String(V[r][0] || '').trim().toLowerCase();
-        const dl = String(V[r][1] || '').trim().toLowerCase();
-        if (em === email.toLowerCase() && dl === dealer.toLowerCase()) {
-          found = r + 1; // 1-based row
+      const rows = perfWrap_('rowByDealer.read', () => valuesGet_(CFG.SHEET_ID, `${CFG.SHEET_NAME}!A${CFG.DATA_START_ROW}:B`, {}));
+
+      const n = rows.length;
+      let foundRow = 0;
+
+      for (let i = 0; i < n; i++) {
+        const em = String((rows[i] && rows[i][0]) || '').trim().toLowerCase();
+        const dl = String((rows[i] && rows[i][1]) || '').trim().toLowerCase();
+        if (em === email && dl === dealer) {
+          foundRow = CFG.DATA_START_ROW + i;
           break;
         }
       }
-      if (!found) return bad_('row not found', 404);
 
-      if (includeCalls) {
-        const calls = sh.getRange(found, 7, 1, 4).getValues()[0].map(v => {
-          if (v instanceof Date) return hasTime_(v) ? toISOdt_(v) : toISO_(v);
-          return String(v || '').trim();
-        });
-        return ok_({ rowIndex: found, callSlots: calls });
+      if (!foundRow) {
+        statusCode = 404;
+        return bad_('row not found', 404);
       }
 
-      return ok_({ rowIndex: found });
+      if (includeCalls) {
+        const callsRow = perfWrap_('rowByDealer.readCalls', () => valuesGet_(CFG.SHEET_ID, `${CFG.SHEET_NAME}!G${foundRow}:J${foundRow}`, {}));
+        const cells = (callsRow[0] || []);
+        const calls = [];
+        for (let k = 0; k < 4; k++) {
+          const v = cells[k];
+          const d = asDate_(v);
+          if (d) calls.push(hasTime_(d) ? toISOdt_(d) : toISO_(d));
+          else calls.push(String(v || '').trim());
+        }
+        const resp = { rowIndex: foundRow, callSlots: calls };
+        if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
+        return ok_(resp);
+      }
+
+      const resp = { rowIndex: foundRow };
+      if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
+      return ok_(resp);
     } catch (err) {
+      statusCode = 500;
       return bad_(err, 500);
     }
   }
 
-  // Due list
-  if (path === 'due') return getDue_(idt);
+  // Due list (optimized: find matching rows first, then batchGet only those rows)
+  if (path === 'due') {
+    const limit = Number((e && e.parameter && e.parameter.limit) || 0) || 0;
+    const cursor = Number((e && e.parameter && e.parameter.cursor) || 0) || 0;
+    const nocache = String((e && e.parameter && (e.parameter.nocache || e.parameter.fresh)) || '').trim() === '1';
+    return getDue_(idt, { attachPerf: PERF_CTX.attachToResponse, limit, cursor, nocache });
+  }
 
+  statusCode = 404;
   return bad_('Unknown GET path', 404);
+  } finally {
+    // best-effort: infer statusCode based on exit path where possible
+    perfFlush_(statusCode);
+  }
 }
 
-/* --- Previous remark till yesterday (for UI) --- */
+// ========== Due handler (optimized IO pattern) ==========
 
-function lastRemarkFromRow_(rowVals, todayDay) {
-  // O:AS -> 15..45
-  if (todayDay <= 1) return { text: '', day: 0 };
+function sheet1RowIndexesForEmail_(email, opt) {
+  const em = normEmail_(email);
+  if (!em) return [];
 
-  const startIdx = CFG.FIRST_DAY_COL - 1;           // O index (0-based)
-  const endIdx = dayToCol_(todayDay - 1) - 1;       // yesterday col index
-
-  for (let c = endIdx; c >= startIdx; c--) {
-    const v = String(rowVals[c] || '').trim();
-    if (v) {
-      const day = (c - startIdx) + 1;               // 1..31
-      return { text: v, day };
+  const nocache = !!(opt && opt.nocache);
+  const cacheKey = `s1idx_v1:${em}`;
+  if (!nocache) {
+    const cached = cacheGetJson_(cacheKey);
+    if (Array.isArray(cached)) {
+      perfAdd_('Sheet1.idx.cacheHit', 0, { rows: cached.length });
+      return cached;
     }
   }
-  return { text: '', day: 0 };
+
+  const colA = perfWrap_('Sheet1.idx.readColA', () => valuesGet_(CFG.SHEET_ID, `${CFG.SHEET_NAME}!A${CFG.DATA_START_ROW}:A`, {}));
+  const rowIndexes = [];
+  const tFilter = Date.now();
+  for (let i = 0; i < colA.length; i++) {
+    const v = String((colA[i] && colA[i][0]) || '').trim().toLowerCase();
+    if (v === em) rowIndexes.push(CFG.DATA_START_ROW + i);
+  }
+  perfAdd_('Sheet1.idx.filter', Date.now() - tFilter, { rows: rowIndexes.length });
+
+  // Short TTL: this is just an index accelerator (not the business data).
+  cachePutJson_(cacheKey, rowIndexes, 120);
+  return rowIndexes;
 }
 
-/* ========== POST Router ========== */
+function getDue_(id_token, opt) {
+  let user;
+  try { user = perfWrap_('auth.verify', () => verify_(id_token)); }
+  catch (err) { return bad_(err, 401); }
+
+  const today = todayIST_();
+  const todayISO = toISO_(today);
+  const todayDay = Number(Utilities.formatDate(today, CFG.TIMEZONE, 'd'));
+  const nowMs = Date.now();
+
+  const nocache = !!(opt && opt.nocache);
+  const limit = Math.max(0, Number(opt && opt.limit) || 0);
+  const cursor = Math.max(0, Number(opt && opt.cursor) || 0);
+
+  const cacheKey = `due_v3:${user.email}:${todayISO}`;
+  if (!nocache && !limit && !cursor) {
+    const cached = cacheGetJson_(cacheKey);
+    if (cached && Array.isArray(cached.items) && cached.today) {
+      perfAdd_('due.cacheHit', 0, { items: cached.items.length });
+      const resp = { items: cached.items, today: cached.today };
+      if (opt && opt.attachPerf) resp.__perf = perfSummary_();
+      return ok_(resp);
+    }
+  }
+
+  // Step-1: locate rows for this email (via cached index)
+  const rowIndexesAll = sheet1RowIndexesForEmail_(user.email, { nocache });
+  const rowIndexes = rowIndexesAll.slice(cursor);
+  if (!rowIndexes.length) return ok_({ items: [], today: todayISO });
+
+  // Step-2: read matched rows (B:D, G:J, O:AS) using contiguous runs to minimize ranges
+  const items = [];
+  const runs = buildRuns_(rowIndexes);
+  perfAdd_('due.runs', 0, { runs: runs.length });
+
+  const dayStartA1 = colA1_(CFG.FIRST_DAY_COL);
+  const dayEndA1 = colA1_(CFG.LAST_DAY_COL);
+
+  const maxRunsPerBatch = 30; // 3 ranges per run => <= 90 ranges per batchGet
+  let scanned = 0; // number of rowIndexes scanned (not items)
+  let nextCursor = 0;
+
+  for (let b = 0; b < runs.length; b += maxRunsPerBatch) {
+    const chunkRuns = runs.slice(b, b + maxRunsPerBatch);
+
+    const ranges = [];
+    const tRanges = Date.now();
+    for (const [s, e] of chunkRuns) {
+      ranges.push(`${CFG.SHEET_NAME}!B${s}:D${e}`); // client + color
+      ranges.push(`${CFG.SHEET_NAME}!G${s}:J${e}`); // followups
+      ranges.push(`${CFG.SHEET_NAME}!${dayStartA1}${s}:${dayEndA1}${e}`); // day slice
+    }
+    perfAdd_('due.buildRanges', Date.now() - tRanges, { runs: chunkRuns.length, ranges: ranges.length });
+
+    const got = perfWrap_('due.readRuns.batch', () => valuesBatchGet_(CFG.SHEET_ID, ranges, { valueRenderOption: 'UNFORMATTED_VALUE' }), { ranges: ranges.length });
+
+    const tTransform = Date.now();
+    for (let i = 0; i < chunkRuns.length; i++) {
+      const [s, e] = chunkRuns[i];
+      const b2dRows = got[i * 3 + 0] || [];
+      const g2jRows = got[i * 3 + 1] || [];
+      const dayRows = got[i * 3 + 2] || [];
+
+      const len = Math.max(0, e - s + 1);
+      for (let off = 0; off < len; off++) {
+        const rowIndex = s + off;
+        scanned++;
+
+        const b2d = b2dRows[off] || [];
+        const g2j = g2jRows[off] || [];
+        const daySlice = dayRows[off] || [];
+
+      const client = (b2d[0] || '');      // B
+      const clientColor = (b2d[2] || ''); // D
+
+      // Build raw due calls (<= today) from G..J
+      const rawDue = [];
+      for (let k = 0; k < 4; k++) {
+        const d = asDate_(g2j[k]);
+        if (!d) continue;
+
+        const plannedISO = toISO_(d);
+        const plannedDateOnly = parseISODate_(plannedISO);
+
+        if (plannedDateOnly.getTime() <= today.getTime()) {
+          const sfAt = hasTime_(d) ? toISOdt_(d) : '';
+          rawDue.push({ callN: k + 1, callDate: plannedISO, sfAt, _dateObj: plannedDateOnly });
+        }
+      }
+      if (!rawDue.length) continue;
+
+      // Window-aware settlement (same logic, but using daySlice)
+      const unsettled = rawDue.filter(dc => !settledInWindowDaySlice_(daySlice, dc._dateObj, today));
+      if (!unsettled.length) continue;
+
+      // Earliest future SF datetime for countdown
+      let sfFutureDate = null;
+      for (let k = 0; k < 4; k++) {
+        const d = asDate_(g2j[k]);
+        if (d && hasTime_(d) && d.getTime() > nowMs) {
+          if (!sfFutureDate || d.getTime() < sfFutureDate.getTime()) sfFutureDate = d;
+        }
+      }
+
+      // Previous remark till yesterday (UI info only)
+      const { text: remarkText, day: remarkDay } = lastRemarkFromDaySlice_(daySlice, todayDay);
+
+      items.push({
+        rowIndex,
+        clientName: client,
+        clientColor: clientColor,
+        dueCalls: unsettled.map(({ callN, callDate, sfAt }) => ({ callN, callDate, sfAt })),
+        sfFuture: sfFutureDate ? toISOdt_(sfFutureDate) : '',
+        todayColA1: colA1_(dayToCol_(todayDay)),
+        remarkText,
+        remarkDay
+      });
+
+        if (limit && items.length >= limit) {
+          nextCursor = cursor + scanned;
+          break;
+        }
+      }
+
+      if (limit && items.length >= limit) break;
+    }
+    perfAdd_('due.transform.batch', Date.now() - tTransform, { runs: chunkRuns.length });
+
+    if (limit && items.length >= limit) break;
+  }
+
+  // Cache the full (unpaged) result briefly to collapse auto-refresh churn.
+  // Keep TTL short to avoid correctness issues.
+  if (!nocache && !limit && !cursor) {
+    cachePutJson_(cacheKey, { items, today: todayISO }, 15);
+  }
+
+  const resp = { items, today: todayISO };
+  if (limit) resp.nextCursor = nextCursor && nextCursor < rowIndexesAll.length ? nextCursor : 0;
+  if (opt && opt.attachPerf) resp.__perf = perfSummary_();
+  return ok_(resp);
+}
+
+// ========== POST Router (kept logic; memo + faster log append + folderId cache) ==========
 
 function doPost(e) {
   const raw = e && e.postData && e.postData.contents || '{}';
   let body = {};
   try { body = JSON.parse(raw); } catch (_) {}
+
   const path = (body.path || (e && e.parameter && e.parameter.path) || '').trim();
   const idt = body.id_token || (e && e.parameter && e.parameter.id_token) || '';
 
+  const perfOn = perfEnabledFrom_(body) || perfEnabledFrom_(e);
+  const attach = String(body.perf || (e && e.parameter && e.parameter.perf) || '').trim() === '1';
+  perfInit_(perfOn, `POST:${path || ''}`, attach);
+  let statusCode = 200;
+  try {
   // Add Dealer (Quick mode)
   if (path === 'addDealer') {
     try {
       const email = String(body.email || '').trim();
       const dealerName = String(body.dealerName || '').trim();
       const color = String(body.color || '').trim();
-      if (!email || !dealerName || !color) {
-        return bad_('email, dealerName, color required', 400);
+      if (!email || !dealerName || !color) return bad_('email, dealerName, color required', 400);
+
+      // Determine new row using Column A length (fast enough)
+      const colA = perfWrap_('addDealer.scanColA', () => valuesGet_(CFG.SHEET_ID, `${CFG.SHEET_NAME}!A${CFG.DATA_START_ROW}:A`, {}));
+      const newRow = CFG.DATA_START_ROW + (colA.length || 0);
+
+      if (sheetsSvcEnabled_()) {
+        perfWrap_('addDealer.writeRow(Sheets)', () => Sheets.Spreadsheets.Values.update(
+          { values: [[email, dealerName, '', color]] },
+          CFG.SHEET_ID,
+          `${CFG.SHEET_NAME}!A${newRow}:D${newRow}`,
+          { valueInputOption: 'USER_ENTERED' }
+        ));
+      } else {
+        const sh = sheet_();
+        perfWrap_('addDealer.writeRow(SpreadsheetApp)', () => sh.getRange(newRow, 1, 1, 4).setValues([[email, dealerName, '', color]]));
       }
 
-      const sh = sheet_();
-      const newRow = sh.getLastRow() + 1;
-      sh.getRange(newRow, 1, 1, 4).setValues([[email, dealerName, '', color]]);
-      return ok_({ rowIndex: newRow });
+      const resp = { rowIndex: newRow };
+      if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
+      return ok_(resp);
     } catch (err) {
+      statusCode = 500;
       return bad_(err, 500);
     }
   }
@@ -427,122 +1064,39 @@ function doPost(e) {
   if (path === 'mark') return postMark_(body, idt, e);
 
   return bad_('Unknown POST path', 404);
+  } finally {
+    perfFlush_(statusCode);
+  }
 }
 
-/* ========== Due handler ========== */
-
-function getDue_(id_token) {
-  let user;
-  try {
-    user = verify_(id_token);
-  } catch (err) {
-    return bad_(err, 401);
-  }
-
-  const sh = sheet_();
-  const lastRow = sh.getLastRow();
-  if (lastRow < CFG.DATA_START_ROW) {
-    return ok_({ items: [], today: toISO_(todayIST_()) });
-  }
-
-  const rng = sh.getRange(
-    CFG.DATA_START_ROW,
-    1,
-    lastRow - CFG.DATA_START_ROW + 1,
-    CFG.LAST_DAY_COL
-  );
-  const V = rng.getValues();
-
-  const today = todayIST_();
-  const todayISO = toISO_(today);
-  const todayDay = Number(Utilities.formatDate(today, CFG.TIMEZONE, 'd'));
-  const items = [];
-
-  for (let r = 0; r < V.length; r++) {
-    const row = V[r];
-    const email = String(row[0] || '').toLowerCase().trim(); // A
-    if (email !== user.email) continue;
-
-    const client = row[1];        // B
-    const clientColor = row[3];   // D
-    const g = row[6], h = row[7], i = row[8], j = row[9]; // G..J
-
-    // Build raw due calls (<= today) from G..J
-    const rawDue = [];
-    [[1, g], [2, h], [3, i], [4, j]].forEach(([n, d]) => {
-      if (d instanceof Date) {
-        const plannedISO = toISO_(d);
-        const plannedDateOnly = parseISODate_(plannedISO);
-        if (plannedDateOnly.getTime() <= today.getTime()) {
-          const sfAt = hasTime_(d) ? toISOdt_(d) : '';
-          rawDue.push({
-            callN: n,
-            callDate: plannedISO,
-            sfAt,
-            _dateObj: plannedDateOnly
-          });
-        }
-      }
-    });
-    if (!rawDue.length) continue;
-
-    // Window-aware settlement
-    const unsettled = rawDue.filter(dc =>
-      !settledInWindow_(row, dc._dateObj, today)
-    );
-    if (!unsettled.length) continue;
-
-    // Earliest future SF datetime for countdown
-    const sfFuture = [g, h, i, j]
-      .filter(x => hasTime_(x) && x.getTime() > new Date().getTime())
-      .sort((a, b) => a - b)[0];
-    const sfWhen = sfFuture ? toISOdt_(sfFuture) : '';
-
-    // Previous remark till yesterday (UI info only)
-    const { text: remarkText, day: remarkDay } =
-      lastRemarkFromRow_(row, todayDay);
-
-    items.push({
-      rowIndex: CFG.DATA_START_ROW + r,
-      clientName: client,
-      clientColor: clientColor,
-      dueCalls: unsettled.map(({ callN, callDate, sfAt }) => ({
-        callN, callDate, sfAt
-      })),
-      sfFuture: sfWhen,
-      todayColA1: colA1_(dayToCol_(todayDay)),
-      remarkText,
-      remarkDay
-    });
-  }
-
-  return ok_({ items, today: todayISO });
-}
-
-/* ========== Mark handler (SF / OR / NR / AI / AP / MD) ========== */
+// ========== Mark handler (same logic/outcomes) ==========
 
 function postMark_(body, id_token, e) {
-  let user;
+  const lock = LockService.getScriptLock();
+  const tLock = Date.now();
+  if (!lock.tryLock(10000)) return bad_('Busy, please retry', 429);
+  perfAdd_('postMark.lockWait', Date.now() - tLock);
+
   try {
-    user = verify_(id_token);
-  } catch (err) {
-    return bad_(err, 401);
-  }
+  let user;
+  try { user = perfWrap_('auth.verify', () => verify_(id_token)); }
+  catch (err) { return bad_(err, 401); }
 
   const rowIndex = Number(body.rowIndex);
   const outcome = String(body.outcome || '').toUpperCase();
   const remark = String(body.remark || '');
-  const plannedDate = String(body.plannedDate || '');  // ISO yyyy-mm-dd
+  const plannedDate = String(body.plannedDate || '');
   const callN = Number(body.callN || 0);
 
   if (!rowIndex || !outcome) return bad_('Missing fields');
 
   const sh = sheet_();
-  const rowVals = sh.getRange(rowIndex, 1, 1, CFG.LAST_DAY_COL).getValues()[0];
+
+  // Read minimal row for auth/client name (still cheap)
+  const rowVals = perfWrap_('postMark.readRowAB', () => sh.getRange(rowIndex, 1, 1, 2).getValues()[0]);
   const email = String(rowVals[0] || '').toLowerCase().trim();
   if (email !== user.email) return bad_('Forbidden', 403);
 
-  // Day to mark (O..AS) only for OR/NR/AI/AP/MD
   const markDayISO = String(body.date || '');
   const markDay = markDayISO ? parseISODate_(markDayISO) : todayIST_();
   const dayNum = Number(Utilities.formatDate(markDay, CFG.TIMEZONE, 'd'));
@@ -550,79 +1104,61 @@ function postMark_(body, id_token, e) {
 
   let actionFileURL = '';
   const nowTs = new Date();
+  const ua = (e && e.parameter && e.parameter.ua) || '';
 
-  /* ----- SF: Schedule Follow-up (only G:J set + log) ----- */
+  // Ensure log sheet exists (and memoized)
+  perfWrap_('postMark.ensureLogSheet', () => logSheet_());
 
+  // ----- SF: Schedule Follow-up (only G:J set + log) -----
   if (outcome === 'SF') {
-    if (!callN || !body.scheduleAt) {
-      return bad_('SF needs callN & scheduleAt');
-    }
+    if (!callN || !body.scheduleAt) return bad_('SF needs callN & scheduleAt');
     const dt = new Date(String(body.scheduleAt)); // datetime-local from UI
     const colNum = 7 + (callN - 1); // G=7, H=8, I=9, J=10
-    sh.getRange(rowIndex, colNum).setValue(dt);   // keep as Date-time
+    perfWrap_('postMark.writeSFSlot', () => sh.getRange(rowIndex, colNum).setValue(dt));
 
-    // Log only
-    logSheet_().appendRow([
+    valuesAppend_(CFG.SHEET_ID, `${CFG.ACTIVITY_LOG_SHEET}!A:N`, [
       Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
       user.email, rowVals[1], rowIndex,
       '', '', 'SF', remark,
       callN || '', plannedDate || '',
       plannedDate || '', Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
-      '', (e && e.parameter && e.parameter.ua) || ''
+      '', ua
     ]);
 
     return ok_({ message: 'SF scheduled', rowIndex });
   }
 
-  /* ----- MD: Owner restricted / no more follow-ups ----- */
-
+  // ----- MD: Owner restricted / no more follow-ups -----
   if (outcome === 'MD') {
     const cellText = remark ? 'MD: ' + remark : 'MD';
+    perfWrap_('postMark.writeDayCell', () => sh.getRange(rowIndex, dayCol).setValue(cellText));
+    perfWrap_('postMark.clearFollowups', () => sh.getRange(rowIndex, 7, 1, 4).clearContent());
 
-    // Directly mark today’s column (no earlier-day guard)
-    sh.getRange(rowIndex, dayCol).setValue(cellText);
-
-    // Clear ALL follow-ups G:J
-    sh.getRange(rowIndex, 7, 1, 4).clearContent();
-
-    // Log
-    logSheet_().appendRow([
+    valuesAppend_(CFG.SHEET_ID, `${CFG.ACTIVITY_LOG_SHEET}!A:N`, [
       Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
       user.email, rowVals[1], rowIndex,
       dayNum, colA1_(dayCol) + rowIndex, 'MD', remark,
       callN || '', plannedDate || '',
       plannedDate || '', Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
-      '', (e && e.parameter && e.parameter.ua) || ''
+      '', ua
     ]);
 
-    return ok_({
-      message: 'MD recorded & follow-ups cleared',
-      a1: colA1_(dayCol) + rowIndex
-    });
+    return ok_({ message: 'MD recorded & follow-ups cleared', a1: colA1_(dayCol) + rowIndex });
   }
 
-  /* ----- OR / NR / AI / AP ----- */
-
-  if (
-    outcome === 'OR' ||
-    outcome === 'NR' ||
-    outcome === 'AI' ||
-    outcome === 'AP'
-  ) {
-    // 1) Day-mark text at O..AS for today
+  // ----- OR / NR / AI / AP -----
+  if (outcome === 'OR' || outcome === 'NR' || outcome === 'AI' || outcome === 'AP') {
     const cellText = remark ? outcome + ': ' + remark : outcome;
-    sh.getRange(rowIndex, dayCol).setValue(cellText);
+    perfWrap_('postMark.writeDayCell', () => sh.getRange(rowIndex, dayCol).setValue(cellText));
 
-    // 2) Clear followups in G:J and set future as per current logic
     const D = dateOnly_(markDay);
-    // Clear (D+1 .. weekEnd(D+15)), then insert at D+15
     const start = new Date(D); start.setDate(start.getDate() + 1);
     const fif = new Date(D);   fif.setDate(fif.getDate() + 15);
     const end = weekEndFor_(fif);
+
     clearFollowupsInRange_(rowIndex, start, end);
     insertFollowupAt_(rowIndex, fif);
 
-    // 3) Optional OR file upload
     if (outcome === 'OR' && body.orFile && body.orFile.base64) {
       const folder = ensureFolder_(CFG.DRIVE_FOLDER_NAME);
       const blob = Utilities.newBlob(
@@ -631,60 +1167,62 @@ function postMark_(body, id_token, e) {
         body.orFile.name || ('Order_' + Date.now())
       );
       const f = folder.createFile(blob);
-      f.setSharing(
-        DriveApp.Access.ANYONE_WITH_LINK,
-        DriveApp.Permission.VIEW
-      );
+      f.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
       actionFileURL = f.getUrl();
     }
 
-    // 4) Activity log
-    logSheet_().appendRow([
+    valuesAppend_(CFG.SHEET_ID, `${CFG.ACTIVITY_LOG_SHEET}!A:N`, [
       Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
       user.email, rowVals[1], rowIndex,
       dayNum, colA1_(dayCol) + rowIndex, outcome, remark,
       callN || '', plannedDate || '',
       plannedDate || '', Utilities.formatDate(nowTs, CFG.TIMEZONE, 'yyyy-MM-dd HH:mm:ss'),
-      actionFileURL, (e && e.parameter && e.parameter.ua) || ''
+      actionFileURL, ua
     ]);
 
-    return ok_({
-      message: 'Marked',
-      a1: colA1_(dayCol) + rowIndex,
-      fileURL: actionFileURL
-    });
+    return ok_({ message: 'Marked', a1: colA1_(dayCol) + rowIndex, fileURL: actionFileURL });
   }
 
   return bad_('Unsupported outcome');
+  } finally {
+    try { lock.releaseLock(); } catch (e) { void e; }
+  }
 }
 
-/* ========== Drive helper ========== */
+// ========== Drive helper (optimized with folderId cache) ==========
 
 function ensureFolder_(name) {
+  const props = PropertiesService.getScriptProperties();
+  const k = 'FOLDER_ID__' + name;
+  const cachedId = props.getProperty(k);
+
+  if (cachedId) {
+    try { return DriveApp.getFolderById(cachedId); }
+    catch (e) { props.deleteProperty(k); }
+  }
+
   const it = DriveApp.getFoldersByName(name);
-  return it.hasNext() ? it.next() : DriveApp.createFolder(name);
+  const folder = it.hasNext() ? it.next() : DriveApp.createFolder(name);
+  props.setProperty(k, folder.getId());
+  return folder;
 }
-
-
 
 /* =========================
    Monthly auto-reset (Sheet1 O:AS)
    ========================= */
 
 function setupMonthlySheet1ResetTrigger() {
-  // Run once manually to create trigger
   deleteTriggers_('runMonthlySheet1Reset');
 
   ScriptApp.newTrigger('runMonthlySheet1Reset')
     .timeBased()
-    .onMonthDay(1)     // every 1st day
-    .atHour(1)         // 01:00 AM IST (safe, midnight clashes avoid)
+    .onMonthDay(1)
+    .atHour(1)
     .nearMinute(10)
     .create();
 }
 
 function runMonthlySheet1Reset() {
-  // idempotent: same month me dubara run na ho
   const props = PropertiesService.getScriptProperties();
   const now = todayIST_();
   const key = Utilities.formatDate(now, CFG.TIMEZONE, 'yyyy-MM');
@@ -692,7 +1230,6 @@ function runMonthlySheet1Reset() {
   if (props.getProperty('SHEET1_LAST_RESET_YYYY_MM') === key) return;
 
   resetSheet1ForNewMonth_();
-
   props.setProperty('SHEET1_LAST_RESET_YYYY_MM', key);
 }
 
@@ -701,47 +1238,40 @@ function resetSheet1ForNewMonth_() {
   const lastRow = sh.getLastRow();
   if (lastRow < CFG.DATA_START_ROW) return;
 
-  // 1) Clear day remarks for all data rows (O:AS)
   const numRows = lastRow - CFG.DATA_START_ROW + 1;
-  const numCols = (CFG.LAST_DAY_COL - CFG.FIRST_DAY_COL + 1); // 31
+  const numCols = (CFG.LAST_DAY_COL - CFG.FIRST_DAY_COL + 1);
   sh.getRange(CFG.DATA_START_ROW, CFG.FIRST_DAY_COL, numRows, numCols).clearContent();
 
-  // 2) Auto-update day headers (dd-MMM) on the row that actually contains 01..31
   const headerRow = detectDayHeaderRow_(sh);
-  const hdr = buildDayHeadersForThisMonth_(); // length 31
+  const hdr = buildDayHeadersForThisMonth_();
   sh.getRange(headerRow, CFG.FIRST_DAY_COL, 1, 31).setValues([hdr]);
-
-  // Optional: if you want, you can also write the month label somewhere
-  // sh.getRange(headerRow - 1, CFG.FIRST_DAY_COL, 1, 1).setValue(Utilities.formatDate(todayIST_(), CFG.TIMEZONE, 'MMMM yyyy'));
 }
 
 function buildDayHeadersForThisMonth_() {
   const now = todayIST_();
   const y = now.getFullYear();
-  const m = now.getMonth(); // 0-based
+  const m = now.getMonth();
   const daysInMonth = new Date(y, m + 1, 0).getDate();
 
   const out = [];
   for (let d = 1; d <= 31; d++) {
     if (d <= daysInMonth) {
       const dt = new Date(y, m, d);
-      out.push(Utilities.formatDate(dt, CFG.TIMEZONE, 'dd-MMM')); // e.g., 01-Jan
+      out.push(Utilities.formatDate(dt, CFG.TIMEZONE, 'dd-MMM'));
     } else {
-      out.push(''); // blank for non-existing dates (30/31)
+      out.push('');
     }
   }
   return out;
 }
 
 function detectDayHeaderRow_(sh) {
-  // Try HEADERS_ROW first, otherwise one row above
   const rA = safeGetDisp_(sh, CFG.HEADERS_ROW);
   const rB = safeGetDisp_(sh, Math.max(1, CFG.HEADERS_ROW - 1));
 
   const score = (arr) =>
     arr.filter(x => String(x).trim().match(/^0?\d{1,2}(-[A-Za-z]{3})?$/)).length;
 
-  // Prefer the row where day-like headers are more
   return score(rA) >= score(rB) ? CFG.HEADERS_ROW : Math.max(1, CFG.HEADERS_ROW - 1);
 }
 
@@ -760,4 +1290,3 @@ function deleteTriggers_(handlerName) {
     }
   });
 }
-

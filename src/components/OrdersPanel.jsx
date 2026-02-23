@@ -1,8 +1,4 @@
-function firstUrl_(s) {
-  const raw = String(s || '').trim()
-  if (!raw) return ''
-  return raw.split(',')[0].trim()
-}
+import { parseOrderUrls } from '../lib/orderUrls.js'
 
 function formatTs_(tsISO) {
   const s = String(tsISO || '').trim()
@@ -12,7 +8,14 @@ function formatTs_(tsISO) {
   return s
 }
 
-export function OrdersPanel({ title, items, onScheduleCall }) {
+function openExternal_(url) {
+  if (!url) return false
+  const win = window.open(url, '_blank', 'noopener,noreferrer')
+  if (win) win.opener = null
+  return !!win
+}
+
+export function OrdersPanel({ title, items, onScheduleCall, onNotify }) {
   return (
     <>
       <div className="panelHeader">
@@ -22,7 +25,7 @@ export function OrdersPanel({ title, items, onScheduleCall }) {
       <div className="list">
         {items.length ? (
           items.map((o, idx) => {
-            const url = firstUrl_(o.orderUrl)
+            const urls = parseOrderUrls(o.orderUrl)
             return (
               <div className="orderCard" key={`${o.orderId || ''}-${idx}`}>
                 <div className="orderTop">
@@ -32,17 +35,45 @@ export function OrdersPanel({ title, items, onScheduleCall }) {
                     <div className="orderMeta">{o.location || ''}</div>
                   </div>
                   <div className="orderActions">
-                    <a
-                      className="btn btnLight"
-                      href={url || '#'}
-                      target="_blank"
-                      rel="noreferrer"
-                      onClick={(e) => {
-                        if (!url) e.preventDefault()
-                      }}
-                    >
-                      View
-                    </a>
+                    {urls.length ? (
+                      urls.map((url, urlIdx) => (
+                        <button
+                          key={`${o.orderId || idx}-${urlIdx}`}
+                          className="btn btnLight"
+                          onClick={() => {
+                            const ok = openExternal_(url)
+                            if (!ok) onNotify?.('Popup blocked. Please allow popups for this site.')
+                          }}
+                        >
+                          {urls.length > 1 ? `View ${urlIdx + 1}` : 'View'}
+                        </button>
+                      ))
+                    ) : (
+                      <button className="btn btnLight" disabled>
+                        View
+                      </button>
+                    )}
+
+                    {urls.length > 1 ? (
+                      <button
+                        className="btn btnLight"
+                        onClick={() => {
+                          let blocked = 0
+                          urls.forEach((url, i) => {
+                            window.setTimeout(() => {
+                              const ok = openExternal_(url)
+                              if (!ok) blocked += 1
+                              if (i === urls.length - 1 && blocked > 0) {
+                                onNotify?.('Some tabs were blocked. Allow popups, then retry Open All.')
+                              }
+                            }, i * 140)
+                          })
+                        }}
+                      >
+                        Open All
+                      </button>
+                    ) : null}
+
                     <button className="btn btnPrimary" onClick={() => onScheduleCall(o)}>
                       Schedule Call
                     </button>
