@@ -127,51 +127,48 @@ export async function getRowByDealer(gasBase, idToken, email, dealer, { includeC
   return jsonGet_(url)
 }
 
-export async function postMarkNoCors(gasBase, body) {
-  if (!gasBase) throw new Error('Missing VITE_SCOT_GAS_BASE')
-  const payload = JSON.stringify(body || {})
+function sleep_(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
 
-  // Preferred: try a readable POST (simple request: no preflight). This lets us detect server-side errors
-  // like Forbidden / invalid token instead of silently "succeeding".
-  try {
-    const { signal, cleanup } = abortable_(null, 15_000)
+async function postJson_(url, payload, { signal, timeoutMs = 15_000, retries = 1 } = {}) {
+  let lastErr = null
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const { signal: sig, cleanup } = abortable_(signal, timeoutMs)
     try {
-      const res = await fetch(gasBase, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
         body: payload,
-        signal,
+        signal: sig,
       })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const json = await res.json()
       if (!json || !json.ok) throw new Error((json && json.error) || 'Request failed')
       return json
+    } catch (err) {
+      lastErr = err
+      const isAbort = err?.name === 'AbortError' || String(err?.message || '').toLowerCase().includes('aborted')
+      if (isAbort || attempt >= retries) break
+      await sleep_(300 * (attempt + 1))
     } finally {
       cleanup()
     }
-  } catch {
-    // Fall through to best-effort fire-and-forget.
   }
 
-  // Best-effort: beacon (most reliable when UI closes quickly).
-  try {
-    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-      const ok = navigator.sendBeacon(gasBase, new Blob([payload], { type: 'text/plain;charset=utf-8' }))
-      if (ok) return null
-    }
-  } catch {
-    // ignore
-  }
+  throw lastErr || new Error('Request failed')
+}
 
-  // Fallback: no-cors fetch. We can't read errors, but the request is attempted.
-  await fetch(gasBase, {
-    method: 'POST',
-    mode: 'no-cors',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    keepalive: true,
-    body: payload,
-  })
-  return null
+export async function postMark(gasBase, body, { signal, timeoutMs = 15_000, retries = 1 } = {}) {
+  if (!gasBase) throw new Error('Missing VITE_SCOT_GAS_BASE')
+  const payload = JSON.stringify(body || {})
+  return postJson_(gasBase, payload, { signal, timeoutMs, retries })
+}
+
+// Backward-compatible alias for existing callers.
+export async function postMarkNoCors(gasBase, body, opts) {
+  return postMark(gasBase, body, opts)
 }
 
 export async function postAddDealer(gasBase, { email, dealerName, color, idToken, signal, timeoutMs = 15_000 } = {}) {

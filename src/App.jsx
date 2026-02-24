@@ -15,14 +15,27 @@ import {
   getRowByDealer,
   getScotDealers,
   getSfRemarks,
-  postMarkNoCors,
+  postMark,
 } from './lib/scotApi.js'
 import { computeOverdueCount, formatDateLabel } from './lib/date.js'
+
+function isAppsScriptExecUrl_(url) {
+  return /^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec(?:\?|$)/i.test(String(url || '').trim())
+}
+
+function resolveOrderPunchPostUrl_() {
+  const candidates = [import.meta.env.VITE_ORDER_PUNCH_POST_URL, import.meta.env.VITE_ORDER_PUNCH_URL]
+  for (const candidate of candidates) {
+    const value = String(candidate || '').trim()
+    if (isAppsScriptExecUrl_(value)) return value
+  }
+  return DEFAULT_ORDER_POST_URL
+}
 
 const CFG = {
   clientId: import.meta.env.VITE_CLIENT_ID,
   gasBase: import.meta.env.VITE_SCOT_GAS_BASE,
-  orderPunchPostUrl: import.meta.env.VITE_ORDER_PUNCH_POST_URL || DEFAULT_ORDER_POST_URL,
+  orderPunchPostUrl: resolveOrderPunchPostUrl_(),
 }
 
 const DEBUG = (() => {
@@ -365,7 +378,7 @@ export default function App() {
         }
         if (outcome === 'SF') payload.scheduleAt = scheduleAt
 
-        await postMarkNoCors(CFG.gasBase, { path: 'mark', id_token: idToken, ...payload })
+        await postMark(CFG.gasBase, { path: 'mark', id_token: idToken, ...payload })
         showToast(`Saved: ${outcome}`)
         closeFollowup()
         await loadAll({ fresh: true })
@@ -379,19 +392,21 @@ export default function App() {
   )
 
   const handleQuickOrderPunched = useCallback(
-    async ({ dealerName }) => {
+    async ({ dealerName, orderId }) => {
       if (!user?.email || !dealerName) return
       setBlocking(true)
       try {
         const row = await getRowByDealer(CFG.gasBase, idToken, user.email, dealerName)
         const nowISO = todayISO || new Date().toISOString().slice(0, 10)
-        await postMarkNoCors(CFG.gasBase, {
+        const orderTag = String(orderId || '').trim()
+        const remark = orderTag ? `Quick Order (orderId=${orderTag})` : 'Quick Order'
+        await postMark(CFG.gasBase, {
           path: 'mark',
           id_token: idToken,
           rowIndex: row.rowIndex,
           date: nowISO,
           outcome: 'OR',
-          remark: 'Quick Order',
+          remark,
           callN: 0,
           plannedDate: nowISO,
         })
@@ -407,23 +422,32 @@ export default function App() {
   )
 
   const handleOrderSubmittedFromFollowup = useCallback(
-    async ({ remark }) => {
+    async ({ remark, orderId }) => {
       const ctx = followup.context
       if (!ctx) return
 
       closeFollowup()
       setBlocking(true)
       try {
-        await postMarkNoCors(CFG.gasBase, {
+        const orderTag = String(orderId || '').trim()
+        const userRemark = String(remark || '').trim()
+        const finalRemark = orderTag
+          ? userRemark
+            ? `${userRemark} | orderId=${orderTag}`
+            : `orderId=${orderTag}`
+          : userRemark
+
+        await postMark(CFG.gasBase, {
           path: 'mark',
           id_token: idToken,
           rowIndex: ctx.rowIndex,
           date: ctx.dateISO,
           outcome: 'OR',
-          remark: remark || '',
+          remark: finalRemark,
           callN: ctx.callN,
           plannedDate: ctx.callDate || ctx.dateISO,
         })
+        showToast('Order saved and OR logged.')
       } catch (e) {
         showToast(`Order submitted, but OR update failed: ${e?.message || 'Unknown error'}`)
       } finally {
@@ -461,7 +485,7 @@ export default function App() {
         const nowISO = todayISO || dateIsoLocal_(new Date())
         const { plannedDateISO, scheduleAtISO } = computeAutoFollowup_(todayISO, { days: 15 })
 
-        await postMarkNoCors(CFG.gasBase, {
+        await postMark(CFG.gasBase, {
           path: 'mark',
           id_token: idToken,
           rowIndex: row.rowIndex,
@@ -530,7 +554,7 @@ export default function App() {
             New Order
           </button>
           <div className="profile">
-            <img className="avatar" src={user.picture || ''} alt="" />
+            {user.picture ? <img className="avatar" src={user.picture} alt="" /> : <div className="avatar" aria-hidden="true" />}
             <div className="email" title={user.email}>
               {user.email}
             </div>

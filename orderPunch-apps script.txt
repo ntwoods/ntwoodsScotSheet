@@ -42,19 +42,16 @@ function getAllowOrigin_(e) {
 }
 
 function applyCors_(output, origin) {
-  var allowOrigin = origin || AUTH_CFG.DEFAULT_ORIGIN;
-  return output
-    .setHeader('Access-Control-Allow-Origin', allowOrigin)
-    .setHeader('Vary', 'Origin')
-    .setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-    .setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With')
-    .setHeader('Access-Control-Max-Age', '86400');
+  // Apps Script ContentService TextOutput does not support setHeader().
+  // Keep passthrough so existing call-sites remain unchanged.
+  void origin;
+  return output;
 }
 
 function doOptions(e) {
-  var origin = getAllowOrigin_(e);
+  void e;
   var out = ContentService.createTextOutput('').setMimeType(ContentService.MimeType.TEXT);
-  return applyCors_(out, origin);
+  return applyCors_(out, '');
 }
 
 function jsonOK(obj)  {
