@@ -110,6 +110,24 @@ a { color: inherit; text-decoration: none; }
   line-height: 1.2;
 }
 .title .muted { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.last7OrdersTrigger {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--text);
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+}
+.last7OrdersTrigger:hover {
+  background: #f8fafc;
+}
+.last7OrdersTrigger span {
+  margin-left: 4px;
+  color: var(--primary);
+}
 
 .topbarRight {
   display: flex;
@@ -315,6 +333,16 @@ a { color: inherit; text-decoration: none; }
   justify-content: flex-end;
   gap: 10px;
   border-top: 1px solid var(--border);
+}
+.last7DealerList {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 6px;
+}
+.last7DealerItem {
+  font-size: 14px;
+  color: var(--text);
 }
 
 .field { display: grid; gap: 6px; margin-bottom: 12px; }

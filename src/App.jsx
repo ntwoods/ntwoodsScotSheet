@@ -6,6 +6,7 @@ import { OrdersPanel } from './components/OrdersPanel.jsx'
 import { QuickOrderModal } from './components/QuickOrderModal.jsx'
 import { ScheduleCallDialog } from './components/ScheduleCallDialog.jsx'
 import { LoaderOverlay } from './components/LoaderOverlay.jsx'
+import { ModalShell } from './components/ModalShell.jsx'
 import { Toast } from './components/Toast.jsx'
 import { DEFAULT_ORDER_POST_URL } from './lib/orderPunchApi.js'
 import {
@@ -52,6 +53,16 @@ function pickArray_(obj, keys) {
     if (Array.isArray(v)) return v
   }
   return []
+}
+
+function pickLast7Orders_(obj) {
+  const raw = obj?.last7Days || obj?.last7days || obj?.last7Orders || obj?.last7 || null
+  const dealers = Array.isArray(raw?.dealers)
+    ? raw.dealers.map((v) => String(v || '').trim()).filter(Boolean)
+    : []
+  const countRaw = Number(raw?.count)
+  const count = Number.isFinite(countRaw) && countRaw >= 0 ? countRaw : dealers.length
+  return { count, dealers }
 }
 
 function pad2_(n) {
@@ -124,11 +135,13 @@ export default function App() {
   const [dueItems, setDueItems] = useState([])
   const [ordersReceived, setOrdersReceived] = useState([])
   const [ordersInProcess, setOrdersInProcess] = useState([])
+  const [last7Orders, setLast7Orders] = useState({ count: 0, dealers: [] })
   const [scotDealers, setScotDealers] = useState([])
 
   const [followup, setFollowup] = useState({ open: false, context: null })
   const [quickOrderOpen, setQuickOrderOpen] = useState(false)
   const [schedule, setSchedule] = useState({ open: false, order: null })
+  const [last7ModalOpen, setLast7ModalOpen] = useState(false)
 
   const loadAbortRef = useRef(null)
   const loadInflightRef = useRef(null)
@@ -218,6 +231,7 @@ export default function App() {
           if (loadReqRef.current === reqId) {
             setOrdersReceived(pickArray_(orderSummary, ['received', 'ordersReceived', 'orders_received']))
             setOrdersInProcess(pickArray_(orderSummary, ['inProcess', 'in_process', 'ordersInProcess', 'orders_in_process']))
+            setLast7Orders(pickLast7Orders_(orderSummary))
           }
 
           if (DEBUG && loadReqRef.current === reqId) {
@@ -237,6 +251,7 @@ export default function App() {
                 if (loadReqRef.current !== reqId) return
                 setOrdersReceived(pickArray_(full, ['received', 'ordersReceived', 'orders_received']))
                 setOrdersInProcess(pickArray_(full, ['inProcess', 'in_process', 'ordersInProcess', 'orders_in_process']))
+                setLast7Orders(pickLast7Orders_(full))
                 lastFullOrdersAtRef.current = now
               })
               .catch(() => {})
@@ -335,10 +350,12 @@ export default function App() {
     setDueItems([])
     setOrdersReceived([])
     setOrdersInProcess([])
+    setLast7Orders({ count: 0, dealers: [] })
     setScotDealers([])
     setFollowup({ open: false, context: null })
     setQuickOrderOpen(false)
     setSchedule({ open: false, order: null })
+    setLast7ModalOpen(false)
     setBlocking(false)
     setSyncing(false)
   }, [])
@@ -539,6 +556,9 @@ export default function App() {
           <div className="title">
             <h1>SCOT Portal</h1>
             <div className="muted">{todayISO ? formatDateLabel(todayISO) : ''}</div>
+            <button type="button" className="last7OrdersTrigger" onClick={() => setLast7ModalOpen(true)}>
+              Last 7 Days Orders: <span>{last7Orders.count}</span>
+            </button>
           </div>
         </div>
 
@@ -618,6 +638,7 @@ export default function App() {
                       due: dueItems.length,
                       received: ordersReceived.length,
                       inProcess: ordersInProcess.length,
+                      last7Days: last7Orders.count,
                       dealers: scotDealers.length,
                     },
                     lastSyncError: lastSyncError || null,
@@ -669,6 +690,22 @@ export default function App() {
           onClose={closeSchedule}
           onSubmit={handleScheduleSubmit}
         />
+      ) : null}
+
+      {last7ModalOpen ? (
+        <ModalShell title={`Last 7 Days Orders (${last7Orders.count})`} onClose={() => setLast7ModalOpen(false)} width="min(560px, 96vw)">
+          {last7Orders.dealers.length ? (
+            <ol className="last7DealerList">
+              {last7Orders.dealers.map((dealer, idx) => (
+                <li key={`${dealer}_${idx}`} className="last7DealerItem">
+                  {dealer}
+                </li>
+              ))}
+            </ol>
+          ) : (
+            <div className="muted">No orders punched by this user in the last 7 days.</div>
+          )}
+        </ModalShell>
       ) : null}
 
       {blocking ? <LoaderOverlay /> : null}

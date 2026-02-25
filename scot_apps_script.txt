@@ -597,12 +597,26 @@ function doGet(e) {
         return bad_(err, 401);
       }
 
-      const cacheKey = `ocs_v3:${user.email}:${fast ? `fast:${windowRows}` : 'full'}`;
+      const cacheKey = `ocs_v4:${user.email}:${fast ? `fast:${windowRows}` : 'full'}`;
       if (!nocache) {
         const cached = cacheGetJson_(cacheKey);
         if (cached && Array.isArray(cached.received) && Array.isArray(cached.inProcess)) {
-          perfAdd_('orderCycle.cacheHit', 0, { received: cached.received.length, inProcess: cached.inProcess.length });
-          const resp = { received: cached.received, inProcess: cached.inProcess };
+          const cachedLast7Dealers = Array.isArray(cached.last7Days && cached.last7Days.dealers)
+            ? cached.last7Days.dealers.map(v => String(v || '').trim()).filter(Boolean)
+            : [];
+          perfAdd_('orderCycle.cacheHit', 0, {
+            received: cached.received.length,
+            inProcess: cached.inProcess.length,
+            last7Count: Number(cached.last7Days && cached.last7Days.count) || cachedLast7Dealers.length
+          });
+          const resp = {
+            received: cached.received,
+            inProcess: cached.inProcess,
+            last7Days: {
+              count: Number(cached.last7Days && cached.last7Days.count) || cachedLast7Dealers.length,
+              dealers: cachedLast7Dealers
+            }
+          };
           if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
           return ok_(resp);
         }
@@ -614,7 +628,7 @@ function doGet(e) {
       if (fast) {
         endRow = getOrderCycleLastRow_();
         if (!endRow || endRow < 2) {
-          const resp = { received: [], inProcess: [] };
+          const resp = { received: [], inProcess: [], last7Days: { count: 0, dealers: [] } };
           if (!nocache) cachePutJson_(cacheKey, resp, 10);
           if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
           return ok_(resp);
@@ -626,16 +640,55 @@ function doGet(e) {
       const fRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!F${startRow}:${fast ? `F${endRow}` : 'F'}`;   // statusF
       const yRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!Y${startRow}:${fast ? `Y${endRow}` : 'Y'}`;   // colY
       const bkRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!BK${startRow}:${fast ? `BK${endRow}` : 'BK'}`; // punchedByEmail
+      const tsRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!A${startRow}:${fast ? `A${endRow}` : 'A'}`; // timestamp
+      const dealerRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!B${startRow}:${fast ? `B${endRow}` : 'B'}`; // dealer
 
-      const [statusCol, yCol, bkCol] = perfWrap_(
+      const [statusCol, yCol, bkCol, tsCol, dealerCol] = perfWrap_(
         'orderCycle.readMeta',
-        () => valuesBatchGet_(CFG.ORDER_CYCLE_SHEET_ID, [fRange, yRange, bkRange], { valueRenderOption: 'UNFORMATTED_VALUE' }),
-        { ranges: 3, startRow, endRow: endRow || null }
+        () => valuesBatchGet_(CFG.ORDER_CYCLE_SHEET_ID, [fRange, yRange, bkRange, tsRange, dealerRange], { valueRenderOption: 'UNFORMATTED_VALUE' }),
+        { ranges: 5, startRow, endRow: endRow || null }
       );
 
-      const n = Math.max(statusCol.length, yCol.length, bkCol.length);
+      const n = Math.max(statusCol.length, yCol.length, bkCol.length, tsCol.length, dealerCol.length);
       const metaByRow = Object.create(null);
       const matchRows = [];
+      const last7Start = todayIST_();
+      last7Start.setDate(last7Start.getDate() - 6);
+      const last7CutoffMs = last7Start.getTime();
+
+      let last7TsCol = tsCol;
+      let last7DealerCol = dealerCol;
+      let last7BkCol = bkCol;
+      let last7BaseRow = startRow;
+
+      if (fast && startRow > 2) {
+        const fullTsRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!A2:A${endRow}`;
+        const fullDealerRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!B2:B${endRow}`;
+        const fullBkRange = `${CFG.ORDER_CYCLE_SHEET_NAME}!BK2:BK${endRow}`;
+        [last7TsCol, last7DealerCol, last7BkCol] = perfWrap_(
+          'orderCycle.readLast7Window',
+          () => valuesBatchGet_(CFG.ORDER_CYCLE_SHEET_ID, [fullTsRange, fullDealerRange, fullBkRange], { valueRenderOption: 'UNFORMATTED_VALUE' }),
+          { ranges: 3, startRow: 2, endRow }
+        );
+        last7BaseRow = 2;
+      }
+
+      const last7Dealers = [];
+      const tLast7 = Date.now();
+      const nLast7 = Math.max(last7TsCol.length, last7DealerCol.length, last7BkCol.length);
+      for (let i = 0; i < nLast7; i++) {
+        const punchedByEmail = normEmail_((last7BkCol[i] && last7BkCol[i][0]) || '');
+        const owner = orderOwnerForPunchedBy_(punchedByEmail);
+        if (!owner || owner !== user.email) continue;
+
+        const tsV = last7TsCol[i] ? last7TsCol[i][0] : '';
+        const tsD = asDate_(tsV);
+        if (!tsD || tsD.getTime() < last7CutoffMs) continue;
+
+        const dealerName = String((last7DealerCol[i] && last7DealerCol[i][0]) || '').trim();
+        if (dealerName) last7Dealers.push(dealerName);
+      }
+      perfAdd_('orderCycle.last7', Date.now() - tLast7, { scanned: nLast7, count: last7Dealers.length, baseRow: last7BaseRow });
 
       const tMatch = Date.now();
       for (let i = 0; i < n; i++) {
@@ -658,10 +711,10 @@ function doGet(e) {
           bucket: isReceived ? 'received' : 'inProcess',
         };
       }
-      perfAdd_('orderCycle.match', Date.now() - tMatch, { matched: matchRows.length });
+      perfAdd_('orderCycle.match', Date.now() - tMatch, { matched: matchRows.length, last7Count: last7Dealers.length });
 
       if (!matchRows.length) {
-        const resp = { received: [], inProcess: [] };
+        const resp = { received: [], inProcess: [], last7Days: { count: last7Dealers.length, dealers: last7Dealers } };
         if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
         if (!nocache) cachePutJson_(cacheKey, resp, 15);
         return ok_(resp);
@@ -729,7 +782,7 @@ function doGet(e) {
         perfAdd_('orderCycle.transform.batch', Date.now() - tTransform, { runs: chunkRuns.length });
       }
 
-      const resp = { received, inProcess };
+      const resp = { received, inProcess, last7Days: { count: last7Dealers.length, dealers: last7Dealers } };
       if (!nocache) cachePutJson_(cacheKey, resp, fast ? 10 : 15);
       if (PERF_CTX.attachToResponse) resp.__perf = perfSummary_();
       return ok_(resp);
