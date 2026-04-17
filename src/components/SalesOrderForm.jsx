@@ -1,6 +1,5 @@
 import { useMemo, useState } from 'react'
 import { filesToOrderPayload_, submitSalesOrder } from '../lib/orderPunchApi.js'
-import { postAddDealer } from '../lib/scotApi.js'
 
 function normalize_(s) {
   return String(s || '').trim().toLowerCase()
@@ -21,15 +20,17 @@ export function SalesOrderForm({
 }) {
   const formMode = String(mode || '').toUpperCase() === 'OR' ? 'OR' : 'NEW'
 
-  const [dealerInput, setDealerInput] = useState('')
+  const [dealerSearch, setDealerSearch] = useState('')
+  const [selectedDealer, setSelectedDealer] = useState('')
   const [dealerListOpen, setDealerListOpen] = useState(false)
   const [marketingPersonName, setMarketingPersonName] = useState('')
   const [dealerLocation, setDealerLocation] = useState('')
   const [files, setFiles] = useState([])
-  const [dealerColor, setDealerColor] = useState('')
   const [errors, setErrors] = useState({})
   const [submitError, setSubmitError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+
+  void scotApiBase
 
   const dealerList = useMemo(
     () =>
@@ -43,23 +44,25 @@ export function SalesOrderForm({
   const dealerSet = useMemo(() => new Set(dealerList.map((x) => normalize_(x))), [dealerList])
 
   const selectedDealerName =
-    formMode === 'OR' ? String(dealerFixedName || '').trim() : String(dealerInput || '').trim()
-  const isNewDealer = formMode === 'NEW' && !!selectedDealerName && !dealerSet.has(normalize_(selectedDealerName))
+    formMode === 'OR' ? String(dealerFixedName || '').trim() : String(selectedDealer || '').trim()
 
   const filteredDealers = useMemo(() => {
-    const needle = normalize_(dealerInput)
+    const needle = normalize_(dealerSearch)
     if (!needle) return dealerList.slice(0, 100)
     return dealerList.filter((d) => normalize_(d).includes(needle)).slice(0, 100)
-  }, [dealerInput, dealerList])
+  }, [dealerSearch, dealerList])
 
   const validate = () => {
     const next = {}
     if (!String(signedInEmail || '').trim()) next.auth = 'Signed-in user email is missing.'
-    if (!selectedDealerName) next.dealerName = 'Dealer Name is required.'
+    if (!selectedDealerName) {
+      next.dealerName = 'Please select an existing dealer from the list.'
+    } else if (formMode === 'NEW' && !dealerSet.has(normalize_(selectedDealerName))) {
+      next.dealerName = 'Only existing dealers can be selected.'
+    }
     if (!String(marketingPersonName || '').trim()) next.marketingPersonName = 'Marketing Person Name is required.'
     if (!String(dealerLocation || '').trim()) next.dealerLocation = 'Dealer Location is required.'
     if (!Array.isArray(files) || !files.length) next.files = 'At least one file is required.'
-    if (isNewDealer && !dealerColor) next.dealerColor = 'Select a color for this new dealer.'
     return next
   }
 
@@ -85,19 +88,6 @@ export function SalesOrderForm({
       }
 
       const result = await submitSalesOrder({ orderPostUrl, payload })
-
-      if (isNewDealer && scotApiBase) {
-        try {
-          await postAddDealer(scotApiBase, {
-            email: signedInEmail,
-            dealerName: selectedDealerName,
-            color: dealerColor,
-            idToken: signedInIdToken,
-          })
-        } catch {
-          onToast?.(`Order submitted, but dealer list update failed for "${selectedDealerName}".`)
-        }
-      }
 
       onToast?.('Order submitted successfully.')
       await Promise.resolve(
@@ -130,16 +120,16 @@ export function SalesOrderForm({
             <div className="dealerSearchWrap">
               <input
                 type="text"
-                value={dealerInput}
+                value={dealerSearch}
                 onChange={(ev) => {
-                  setDealerInput(ev.target.value)
+                  setDealerSearch(ev.target.value)
                   setDealerListOpen(true)
                 }}
                 onFocus={() => setDealerListOpen(true)}
                 onBlur={() => {
                   window.setTimeout(() => setDealerListOpen(false), 120)
                 }}
-                placeholder="Search or type dealer name"
+                placeholder="Search existing dealer"
                 autoComplete="off"
                 disabled={submitting}
               />
@@ -150,49 +140,30 @@ export function SalesOrderForm({
                       <button
                         type="button"
                         key={dealer}
-                        className="dealerSearchItem"
+                        className={`dealerSearchItem${selectedDealer === dealer ? ' active' : ''}`}
                         onMouseDown={(ev) => ev.preventDefault()}
                         onClick={() => {
-                          setDealerInput(dealer)
+                          setSelectedDealer(dealer)
+                          setDealerSearch(dealer)
                           setDealerListOpen(false)
+                          setErrors((prev) => ({ ...prev, dealerName: '' }))
                         }}
                       >
                         {dealer}
                       </button>
                     ))
                   ) : (
-                    <div className="dealerSearchEmpty">No match. Press Enter to keep typed value.</div>
+                    <div className="dealerSearchEmpty">No matching dealer found in your existing list.</div>
                   )}
                 </div>
               ) : null}
             </div>
-            <div className="hint">Filtered by your SCOT mapping ({String(signedInEmail || '').trim() || 'no email'}).</div>
+            <div className="hint">Only existing dealers from your SCOT mapping can be selected.</div>
+            {selectedDealerName ? <div className="hint">Selected Dealer: {selectedDealerName}</div> : null}
           </>
         )}
         {errors.dealerName ? <div className="fieldError">{errors.dealerName}</div> : null}
       </div>
-
-      {isNewDealer ? (
-        <div className="field">
-          <label>New Dealer Color</label>
-          <div className="colorOptions">
-            {['Red', 'Yellow', 'Green'].map((c) => (
-              <label className="colorOption" key={c}>
-                <input
-                  type="radio"
-                  name="dealerColor"
-                  value={c}
-                  checked={dealerColor === c}
-                  onChange={(ev) => setDealerColor(ev.target.value)}
-                  disabled={submitting}
-                />
-                <span>{c}</span>
-              </label>
-            ))}
-          </div>
-          {errors.dealerColor ? <div className="fieldError">{errors.dealerColor}</div> : null}
-        </div>
-      ) : null}
 
       <div className="field">
         <label>Marketing Person Name</label>
